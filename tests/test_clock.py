@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
-
 import sys
 import unittest
 from pathlib import Path
@@ -53,7 +51,10 @@ class ClockTests(unittest.TestCase):
         self.assertEqual(clock["active"], SECOND)
 
     def test_staged_reminder_boundaries(self):
-        schedule = parse_reminder_schedule("300:60,120:30,60:10,30:5")
+        schedule = parse_reminder_schedule("86400:60,180:30,120:15,60:10,30:5")
+        self.assertEqual(crossed_reminder(241.2, 239.8, schedule), 240)
+        self.assertEqual(crossed_reminder(151.2, 149.8, schedule), 150)
+        self.assertEqual(crossed_reminder(121.2, 119.8, schedule), 120)
         self.assertEqual(crossed_reminder(61.2, 59.8, schedule), 60)
         self.assertEqual(crossed_reminder(31.2, 29.8, schedule), 30)
         self.assertIsNone(crossed_reminder(29.9, 26.0, schedule))

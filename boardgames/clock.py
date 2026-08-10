@@ -218,7 +218,7 @@ def swap_clock_sides(clock: dict[str, Any] | None) -> None:
 
 
 def format_seconds(seconds: float) -> str:
-    value = max(0, int(math.ceil(seconds)))
+    value = max(0, math.ceil(seconds))
     hours, rest = divmod(value, 3600)
     minutes, secs = divmod(rest, 60)
     if hours:
@@ -279,8 +279,8 @@ def crossed_reminder(
     """Return the most urgent whole-second reminder boundary just crossed."""
     if current >= previous:
         return None
-    upper = max(1, int(math.floor(previous)))
-    lower = max(1, int(math.ceil(current)))
+    upper = max(1, math.floor(previous))
+    lower = max(1, math.ceil(current))
     for second in range(lower, upper + 1):
         interval = reminder_interval(float(second), schedule)
         if interval and second % interval == 0 and current <= second < previous:
