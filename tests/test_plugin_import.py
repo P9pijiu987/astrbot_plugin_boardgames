@@ -289,6 +289,36 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         await plugin.terminate()
 
+    async def test_tictactoe_natural_end_emits_one_combined_image(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        context = SimpleNamespace(send_message=lambda *_args, **_kwargs: None)
+        plugin = module.BoardGamesPlugin(context, {})
+        starter = _Event("1", "甲")
+        joiner = _Event("2", "乙")
+        await _collect(plugin.start_game(starter, "井字棋", "不计时"))
+        await _collect(plugin.join_game(joiner))
+        await _collect(plugin.choose_first(starter))
+
+        for user_id, name, move in (
+            ("1", "甲", "1"),
+            ("2", "乙", "4"),
+            ("1", "甲", "2"),
+            ("2", "乙", "5"),
+        ):
+            results = await _collect(
+                plugin.receive_bare_move(_Event(user_id, name, move))
+            )
+            self.assertEqual(len(results), 1)
+
+        ended = await _collect(plugin.receive_bare_move(_Event("1", "甲", "3")))
+        self.assertEqual([item[0] for item in ended], ["chain", "plain"])
+        self.assertEqual(len(ended[0][1]), 1)
+        self.assertEqual(ended[0][1][0][0], "image")
+        self.assertTrue(ended[0][1][0][1].startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("获胜", ended[1][1])
+        self.assertIsNone(plugin.store.get(starter.unified_msg_origin))
+        await plugin.terminate()
+
     async def test_go_analysis_returns_rates_recommendation_and_pure_influence_image(self):
         module = importlib.import_module("astrbot_plugin_boardgames.main")
         context = SimpleNamespace(send_message=lambda *_args, **_kwargs: None)

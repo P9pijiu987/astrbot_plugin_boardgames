@@ -317,7 +317,7 @@ class BoardGamesPlugin(Star):
         try:
             request = urllib.request.Request(
                 url,
-                headers={"User-Agent": "astrbot-plugin-boardgames/2.4.2"},
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.4.3"},
             )
             with urllib.request.urlopen(request, timeout=3) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
@@ -400,6 +400,13 @@ class BoardGamesPlugin(Star):
             records,
             avatars,
             reason,
+        )
+
+    async def _combine_end_images(
+        self, board_image: bytes, result_card: bytes
+    ) -> bytes:
+        return await asyncio.to_thread(
+            self.renderer.combine_end_images, board_image, result_card
         )
 
     @staticmethod
@@ -1088,10 +1095,15 @@ class BoardGamesPlugin(Star):
                 self._cancel_clock(key)
                 self.store.remove(key)
             await self._persist()
-        yield self._image_result(event, image)
         if end_text:
-            yield self._image_result(event, result_card)
+            # 某些平台会吞掉短时间内连续发送的第二张图片；终局只发送一张
+            # “最终棋盘 + 结算卡”长图，保证结算信息一定可见。
+            assert result_card is not None
+            end_image = await self._combine_end_images(image, result_card)
+            yield self._image_result(event, end_image)
             yield event.plain_result(end_text)
+        else:
+            yield self._image_result(event, image)
 
     @filter.command("下棋")
     async def move_command_fallback(
