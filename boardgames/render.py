@@ -20,6 +20,7 @@ class BoardRenderer:
     INK = "#242424"
     ORIGIN = "#F4B942"
     TARGET = "#5FB36A"
+    FRAME = "#5D4632"
 
     def __init__(self, assets_dir: str | Path):
         assets = Path(assets_dir)
@@ -32,6 +33,42 @@ class BoardRenderer:
             return ImageFont.truetype(str(path), size)
         except OSError:
             return ImageFont.load_default()
+
+    @staticmethod
+    def _coord_font(size: int):
+        """棋盘边缘专用的清晰无衬线字体，不影响正文的美术字体。"""
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", size)
+        except OSError:
+            try:
+                return ImageFont.load_default(size=size)
+            except TypeError:  # Pillow 10.0 的兼容回退
+                return ImageFont.load_default()
+
+    @staticmethod
+    def _latin_coord(index: int) -> str:
+        return chr(65 + index)
+
+    @classmethod
+    def _board_frame(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        rect: tuple[float, float, float, float],
+        color: str | None = None,
+    ) -> None:
+        x0, y0, x1, y1 = rect
+        draw.rounded_rectangle(
+            (x0 - 6, y0 - 6, x1 + 6, y1 + 6),
+            radius=7,
+            outline="#D8C8AA",
+            width=2,
+        )
+        draw.rounded_rectangle(
+            (x0 - 4, y0 - 4, x1 + 4, y1 + 4),
+            radius=5,
+            outline=color or cls.FRAME,
+            width=4,
+        )
 
     def _header(self, draw: ImageDraw.ImageDraw, session: GameSession) -> None:
         title_font = self._font(30)
@@ -466,7 +503,7 @@ class BoardRenderer:
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
         flipped = self._flipped(session)
-        coord_font = self._font(16)
+        coord_font = self._coord_font(18)
         piece_font = self._font(49, pieces=True)
         symbols = {
             "r": "♜",
@@ -499,6 +536,9 @@ class BoardRenderer:
                         fill="#111111",
                         anchor="mm",
                     )
+        self._board_frame(
+            draw, (left, top, left + board_size, top + board_size), "#65472F"
+        )
         if engine.last_move:
             origin, target = engine.last_move
             for pos, color in ((origin, self.ORIGIN), (target, self.TARGET)):
@@ -519,7 +559,7 @@ class BoardRenderer:
                         color,
                     )
         for i in range(8):
-            file_label = chr(97 + (7 - i if flipped else i))
+            file_label = self._latin_coord(7 - i if flipped else i)
             rank_label = str((i + 1) if flipped else (8 - i))
             draw.text(
                 (left + i * cell + cell / 2, top + board_size + 8),
@@ -616,6 +656,9 @@ class BoardRenderer:
             fill="#6B4423",
             anchor="mm",
         )
+        self._board_frame(
+            draw, (left, top, left + width, top + board_height), "#6B4423"
+        )
         piece_font = self._font(28)
         for y in range(10):
             for x in range(9):
@@ -649,10 +692,10 @@ class BoardRenderer:
                     draw.ellipse(
                         (px - 29, py - 29, px + 29, py + 29), outline=color, width=6
                     )
-        coord_font = self._font(15)
+        coord_font = self._coord_font(17)
         for screen_x in range(9):
             logical_x = 8 - screen_x if flipped else screen_x
-            label = chr(97 + logical_x)
+            label = self._latin_coord(logical_x)
             draw.text(
                 (left + screen_x * cell, top + board_height + 40),
                 label,
@@ -758,6 +801,9 @@ class BoardRenderer:
                     ),
                     fill="#3B2A1D",
                 )
+        self._board_frame(
+            draw, (left, top, left + extent, top + extent), "#6B4423"
+        )
         for y in range(engine.size):
             for x in range(engine.size):
                 stone = engine.board[y][x]
@@ -795,7 +841,7 @@ class BoardRenderer:
                 outline=self.TARGET,
                 width=4,
             )
-        coord_font = self._font(14)
+        coord_font = self._coord_font(15)
         for screen_i in range(engine.size):
             logical_i = engine.size - 1 - screen_i if flipped else screen_i
             letter = _GO_LETTERS[logical_i]
@@ -863,6 +909,9 @@ class BoardRenderer:
             draw.line(
                 (left + i * cell, top, left + i * cell, top + extent), fill="#3B2A1D"
             )
+        self._board_frame(
+            draw, (left, top, left + extent, top + extent), "#6B4423"
+        )
         for y in range(engine.size):
             for x in range(engine.size):
                 stone = engine.board[y][x]
@@ -900,10 +949,10 @@ class BoardRenderer:
                 outline=self.TARGET,
                 width=4,
             )
-        coord_font = self._font(14)
+        coord_font = self._coord_font(15)
         for screen_i in range(engine.size):
             logical_i = engine.size - 1 - screen_i if flipped else screen_i
-            letter = chr(65 + logical_i)
+            letter = self._latin_coord(logical_i)
             number = str((screen_i + 1) if flipped else (engine.size - screen_i))
             draw.text(
                 (left + screen_i * cell, top + extent + cell * 0.65),
@@ -990,12 +1039,15 @@ class BoardRenderer:
                 ),
                 self.TARGET,
             )
-        font = self._font(15)
+        self._board_frame(
+            draw, (left, top, left + size, top + size), "#173B25"
+        )
+        font = self._coord_font(17)
         for i in range(8):
             logical_i = 7 - i if flipped else i
             draw.text(
                 (left + i * cell + cell / 2, top + size + 8),
-                chr(65 + logical_i),
+                self._latin_coord(logical_i),
                 font=font,
                 fill=self.INK,
                 anchor="ma",
@@ -1009,7 +1061,7 @@ class BoardRenderer:
             )
             draw.text(
                 (left + i * cell + cell / 2, top - 8),
-                chr(65 + logical_i),
+                self._latin_coord(logical_i),
                 font=font,
                 fill=self.INK,
                 anchor="md",
@@ -1045,6 +1097,9 @@ class BoardRenderer:
                 fill="#555",
                 width=8,
             )
+        self._board_frame(
+            draw, (left, top, left + size, top + size), "#4D4D4D"
+        )
         font = self._font(105)
         for y in range(3):
             for x in range(3):
@@ -1077,19 +1132,19 @@ class BoardRenderer:
                 ),
                 self.TARGET,
             )
-        coord_font = self._font(15)
+        coord_font = self._coord_font(17)
         for i in range(3):
             logical_i = 2 - i if flipped else i
             draw.text(
                 (left + i * cell + cell / 2, top - 12),
-                chr(65 + logical_i),
+                self._latin_coord(logical_i),
                 font=coord_font,
                 fill=self.INK,
                 anchor="md",
             )
             draw.text(
                 (left + i * cell + cell / 2, top + size + 12),
-                chr(65 + logical_i),
+                self._latin_coord(logical_i),
                 font=coord_font,
                 fill=self.INK,
                 anchor="ma",

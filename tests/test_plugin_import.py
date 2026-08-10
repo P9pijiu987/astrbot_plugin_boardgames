@@ -326,7 +326,7 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
             await plugin.terminate()
             self.assertEqual(path.read_text(encoding="utf-8"), "{corrupt")
 
-    async def test_start_join_and_bare_move_emit_image_only(self):
+    async def test_images_stay_pure_and_key_actions_are_sent_separately(self):
         module = importlib.import_module("astrbot_plugin_boardgames.main")
         context = SimpleNamespace(send_message=lambda *_args, **_kwargs: None)
         plugin = module.BoardGamesPlugin(context, {})
@@ -336,17 +336,22 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started[0][0], "chain")
         self.assertEqual(len(started[0][1]), 1)
         self.assertEqual(started[0][1][0][0], "image")
+        self.assertEqual(started[1][0], "plain")
+        self.assertIn("/加入棋局", started[1][1])
 
         joiner = _Event("2", "乙")
         joined = await _collect(plugin.join_game(joiner))
         self.assertEqual(joined[0][0], "chain")
         self.assertEqual(len(joined[0][1]), 1)
+        self.assertEqual(joined[1][0], "plain")
+        self.assertIn("/选先", joined[1][1])
 
         selected = await _collect(plugin.choose_first(starter))
         self.assertEqual(selected[0][0], "chain")
         self.assertEqual(selected[1][0], "chain")
         self.assertEqual(selected[2][0], "plain")
         self.assertIn("本局用时", selected[2][1])
+        self.assertIn("现在轮到", selected[2][1])
         session = plugin.store.get(starter.unified_msg_origin)
         self.assertEqual(session.status, "playing")
         self.assertEqual(session.players["first"].user_id, "1")
@@ -362,6 +367,19 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
             plugin.store.get(move.unified_msg_origin).engine.moves, ["b1c3"]
         )
         await plugin.terminate()
+
+    async def test_legacy_five_minute_reminder_default_is_upgraded(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        config = {
+            "clock_reminder_schedule": "300:60,120:30,60:10,30:5",
+        }
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), config)
+        schedule = plugin._reminder_schedule()
+        self.assertIn((86400, 60), schedule)
+        self.assertEqual(
+            config["clock_reminder_schedule"],
+            module.DEFAULT_REMINDER_SCHEDULE,
+        )
 
     async def test_tictactoe_natural_end_emits_one_combined_image(self):
         module = importlib.import_module("astrbot_plugin_boardgames.main")

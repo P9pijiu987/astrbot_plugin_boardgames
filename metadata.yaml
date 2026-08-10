@@ -1,6 +1,6 @@
 name: astrbot_plugin_boardgames
 display_name: 多棋盘对弈
-version: 2.5.0
+version: 2.5.1
 author: "Soulter（原版）/ Codex 重写"
 desc: "群聊多棋种对弈插件，支持国际象棋、围棋、中国象棋、五子棋、井字棋和黑白棋。"
 short_desc: "六种棋类、对阵与终局卡、比赛棋钟、战绩等级分、围棋势力图和竞赛规则。"
