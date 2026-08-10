@@ -58,9 +58,13 @@ class BoardRenderer:
                 isinstance(session.engine, XiangqiEngine)
                 and session.engine._in_check(session.engine.turn)
             )
-            status = (
-                f"轮到 {side_name} · {side_name}视角"
-                + (" · 将军" if in_check else "")
+            perspective = (
+                ""
+                if isinstance(session.engine, TicTacToeEngine)
+                else f" · {side_name}视角"
+            )
+            status = f"轮到 {side_name}{perspective}" + (
+                " · 将军" if in_check else ""
             )
         draw.text((728, 27), status, font=info_font, fill="#555555", anchor="ra")
         first = session.players.get(FIRST)
@@ -174,7 +178,13 @@ class BoardRenderer:
 
     @staticmethod
     def _flipped(session: GameSession) -> bool:
-        return session.status == "playing" and session.engine.turn == SECOND
+        # 井字棋的 1～9 格位是固定键盘布局；翻转会让同一个数字在双方眼中
+        # 指向不同位置，因此它始终保持 X 方视角。
+        return (
+            not isinstance(session.engine, TicTacToeEngine)
+            and session.status == "playing"
+            and session.engine.turn == SECOND
+        )
 
     @staticmethod
     def _oriented_point(
@@ -429,6 +439,21 @@ class BoardRenderer:
             anchor="mm",
         )
         draw.text((380, 522), "战绩与等级分已记录", font=self._font(15), fill="#8B8177", anchor="mm")
+        stream = io.BytesIO()
+        image.save(stream, format="PNG", optimize=True)
+        return stream.getvalue()
+
+    def combine_end_images(self, board_data: bytes, result_data: bytes) -> bytes:
+        """把终局棋盘和结算卡合成一张图，避免平台漏发第二张图片。"""
+        with Image.open(io.BytesIO(board_data)) as board_source:
+            board = board_source.convert("RGB")
+        with Image.open(io.BytesIO(result_data)) as result_source:
+            result = result_source.convert("RGB")
+        gap = 14
+        width = max(board.width, result.width)
+        image = Image.new("RGB", (width, board.height + gap + result.height), self.BG)
+        image.paste(board, ((width - board.width) // 2, 0))
+        image.paste(result, ((width - result.width) // 2, board.height + gap))
         stream = io.BytesIO()
         image.save(stream, format="PNG", optimize=True)
         return stream.getvalue()

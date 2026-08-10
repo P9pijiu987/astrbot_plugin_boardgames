@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import sys
 import unittest
 from pathlib import Path
+
+from PIL import Image
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
@@ -185,6 +188,28 @@ class RulesTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_tictactoe_keeps_fixed_orientation(self):
+        tictactoe = TicTacToeEngine()
+        self.assertTrue(tictactoe.play("1").ok)
+        session = GameSession(
+            "test",
+            "tictactoe",
+            tictactoe,
+            {FIRST: Player("1", "甲"), SECOND: Player("2", "乙")},
+            status="playing",
+        )
+        self.assertEqual(tictactoe.turn, SECOND)
+        self.assertFalse(BoardRenderer._flipped(session))
+
+        chess = GameSession(
+            "test-chess",
+            "chess",
+            ChessEngine(["e2e4"]),
+            {FIRST: Player("1", "甲"), SECOND: Player("2", "乙")},
+            status="playing",
+        )
+        self.assertTrue(BoardRenderer._flipped(chess))
+
     def test_all_boards_render_as_png(self):
         renderer = BoardRenderer(PLUGIN_ROOT / "assets")
         engines = [
@@ -263,6 +288,18 @@ class RenderingTests(unittest.TestCase):
         )
         self.assertTrue(match.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertTrue(result.startswith(b"\x89PNG\r\n\x1a\n"))
+
+        board = renderer.render(session)
+        combined = renderer.combine_end_images(board, result)
+        with Image.open(io.BytesIO(board)) as board_image, Image.open(
+            io.BytesIO(result)
+        ) as result_image, Image.open(io.BytesIO(combined)) as combined_image:
+            self.assertEqual(
+                combined_image.width, max(board_image.width, result_image.width)
+            )
+            self.assertGreater(
+                combined_image.height, board_image.height + result_image.height
+            )
 
 
 if __name__ == "__main__":
