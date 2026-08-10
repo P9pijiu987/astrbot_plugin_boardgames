@@ -188,6 +188,12 @@ class RulesTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_board_edge_coordinates_use_uppercase_clear_font(self):
+        self.assertEqual(BoardRenderer._latin_coord(0), "A")
+        self.assertEqual(BoardRenderer._latin_coord(7), "H")
+        family, _style = BoardRenderer._coord_font(17).getname()
+        self.assertIn(family, {"DejaVu Sans", "Aileron"})
+
     def test_tictactoe_keeps_fixed_orientation(self):
         tictactoe = TicTacToeEngine()
         self.assertTrue(tictactoe.play("1").ok)

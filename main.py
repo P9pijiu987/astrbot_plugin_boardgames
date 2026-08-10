@@ -55,6 +55,10 @@ DEFAULT_TIME_CONTROLS = {
     "tictactoe": "2+2",
     "reversi": "10",
 }
+DEFAULT_REMINDER_SCHEDULE = "86400:60,180:30,120:15,60:10,30:5"
+# 2.4.0 之前的默认值只在 5 分钟内提醒。AstrBot 会保留升级前的配置，
+# 因此要识别这个旧默认值；用户自行定制的规则不应被覆盖。
+LEGACY_REMINDER_SCHEDULES = {"300:60,120:30,60:10,30:5"}
 PLUGIN_DATA_DIR_NAME = "astrbot_plugin_boardgames"
 MIGRATABLE_PLUGIN_NAMES = {
     "astrbot_plugin_boardgames",
@@ -358,7 +362,7 @@ class BoardGamesPlugin(Star):
         try:
             request = urllib.request.Request(
                 url,
-                headers={"User-Agent": "astrbot-plugin-boardgames/2.5.0"},
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.5.1"},
             )
             with urllib.request.urlopen(request, timeout=3) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
@@ -476,14 +480,22 @@ class BoardGamesPlugin(Star):
         raw = str(
             self.config.get(
                 "clock_reminder_schedule",
-                "86400:60,180:30,120:15,60:10,30:5",
+                DEFAULT_REMINDER_SCHEDULE,
             )
-        )
+        ).replace(" ", "")
+        if raw in LEGACY_REMINDER_SCHEDULES:
+            logger.info("检测到旧版棋钟默认提醒规则，已自动升级为全程每分钟提醒。")
+            raw = DEFAULT_REMINDER_SCHEDULE
+            try:
+                self.config["clock_reminder_schedule"] = raw
+            except (TypeError, AttributeError):
+                # 即使宿主传入只读配置，当前运行实例也会使用新默认值。
+                pass
         try:
             return parse_reminder_schedule(raw)
         except ValueError:
             logger.warning(f"无效的棋钟提醒规则 {raw!r}，已使用默认值。")
-            return parse_reminder_schedule("86400:60,180:30,120:15,60:10,30:5")
+            return parse_reminder_schedule(DEFAULT_REMINDER_SCHEDULE)
 
     def _schedule_clock(self, session: GameSession) -> None:
         old = self.clock_tasks.pop(session.key, None)
@@ -514,7 +526,25 @@ class BoardGamesPlugin(Star):
         )
 
     @staticmethod
-    def _clock_start_text(session: GameSession) -> str:
+    def _action_prompt(session: GameSession) -> str:
+        if session.status == "waiting":
+            return "棋局已创建，等待另一位玩家输入 /加入棋局。"
+        if session.status == "choosing":
+            return (
+                "双方已加入。任一选手请输入 /选先 或 /选后；"
+                "也可按棋种使用 /选黑、/选白、/选红，对手会自动获得另一方。"
+            )
+        if session.status != "playing":
+            return ""
+        if isinstance(session.engine, GomokuEngine) and session.engine.opening_prompt:
+            return f"Swap2：{session.engine.opening_prompt}"
+        side = session.engine.turn
+        side_name = session.engine.side_names[0 if side == FIRST else 1]
+        player = session.players.get(side)
+        return f"现在轮到 {player.name if player else side_name}（{side_name}），可直接输入走法。"
+
+    @classmethod
+    def _clock_start_text(cls, session: GameSession) -> str:
         label = session.clock.get("label") if session.clock else "不计时"
         if session.clock and session.clock.get("mode") == "byoyomi":
             explanation = f"本局读秒用时：{label}（基本用时 | 读秒次数×每次秒数）。"
@@ -522,11 +552,13 @@ class BoardGamesPlugin(Star):
             explanation = f"本局用时：{label}（每方基础分钟 + 每步加秒）。"
         else:
             explanation = f"本局用时：{label}。"
-        return (
+        text = (
             f"{explanation}\n"
             "本局开始后不能修改棋钟；下次开局可追加 计时=15+10、"
             "计时=60|3x30 或 不计时。使用 /计时规则 查看完整说明。"
         )
+        prompt = cls._action_prompt(session)
+        return f"{text}\n{prompt}" if prompt else text
 
     async def _clock_watch(self, key: str) -> None:
         schedule = self._reminder_schedule()
@@ -777,6 +809,7 @@ class BoardGamesPlugin(Star):
             yield event.plain_result(error)
         else:
             yield self._image_result(event, image)
+            yield event.plain_result("棋局已创建，等待另一位玩家输入 /加入棋局。")
 
     @filter.regex(
         r"^/开局(国际象棋|西洋棋|围棋|中国象棋|象棋|五子棋|井字棋|黑白棋)(?:\s+(.*))?$",
@@ -791,6 +824,7 @@ class BoardGamesPlugin(Star):
             yield event.plain_result(error)
         else:
             yield self._image_result(event, image)
+            yield event.plain_result("棋局已创建，等待另一位玩家输入 /加入棋局。")
 
     @filter.command("加入棋局", alias={"加入对局"})
     async def join_game(self, event: AstrMessageEvent):
@@ -820,7 +854,11 @@ class BoardGamesPlugin(Star):
             await self._persist()
             board_image = await self._render(session)
             match_card = await self._render_match_card(session) if is_swap2 else None
-            start_text = self._clock_start_text(session) if is_swap2 else ""
+            start_text = (
+                self._clock_start_text(session)
+                if is_swap2
+                else self._action_prompt(session)
+            )
         if match_card:
             yield self._image_result(event, match_card)
         yield self._image_result(event, board_image)
@@ -979,6 +1017,11 @@ class BoardGamesPlugin(Star):
             yield event.plain_result(error)
         else:
             yield self._image_result(event, image)
+            session = self.store.get(self._key(event))
+            if session:
+                prompt = self._action_prompt(session)
+                if prompt:
+                    yield event.plain_result(prompt)
 
     @filter.command("选白")
     async def choose_white(self, event: AstrMessageEvent):
@@ -1114,6 +1157,7 @@ class BoardGamesPlugin(Star):
             session.pending = None
             image = await self._render(session)
             end_text = ""
+            action_text = ""
             result_card = None
             if outcome.ended:
                 if outcome.draw:
@@ -1138,6 +1182,8 @@ class BoardGamesPlugin(Star):
                     )
                 self._cancel_clock(key)
                 self.store.remove(key)
+            elif isinstance(session.engine, GomokuEngine) and session.engine.opening_prompt:
+                action_text = self._action_prompt(session)
             await self._persist()
         if end_text:
             # 某些平台会吞掉短时间内连续发送的第二张图片；终局只发送一张
@@ -1148,6 +1194,8 @@ class BoardGamesPlugin(Star):
             yield event.plain_result(end_text)
         else:
             yield self._image_result(event, image)
+            if action_text:
+                yield event.plain_result(action_text)
 
     @filter.command("下棋")
     async def move_command_fallback(
@@ -1643,7 +1691,7 @@ class BoardGamesPlugin(Star):
 
     @filter.command("棋盘", alias={"棋局"})
     async def show_board(self, event: AstrMessageEvent):
-        """重新发送当前棋盘（只发送图片）。"""
+        """重新发送当前棋盘，并在需要操作时另发醒目文字提示。"""
         key = self._key(event)
         async with self.store.lock(key):
             session = self.store.get(key)
@@ -1651,7 +1699,10 @@ class BoardGamesPlugin(Star):
                 yield event.plain_result("当前没有棋局。")
                 return
             image = await self._render(session)
+            prompt = self._action_prompt(session)
         yield self._image_result(event, image)
+        if prompt:
+            yield event.plain_result(prompt)
 
     @filter.command("棋钟", alias={"时间", "剩余时间"})
     async def show_clock(self, event: AstrMessageEvent):

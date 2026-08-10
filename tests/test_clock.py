@@ -52,6 +52,7 @@ class ClockTests(unittest.TestCase):
 
     def test_staged_reminder_boundaries(self):
         schedule = parse_reminder_schedule("86400:60,180:30,120:15,60:10,30:5")
+        self.assertEqual(crossed_reminder(3541.2, 3539.8, schedule), 3540)
         self.assertEqual(crossed_reminder(241.2, 239.8, schedule), 240)
         self.assertEqual(crossed_reminder(151.2, 149.8, schedule), 150)
         self.assertEqual(crossed_reminder(121.2, 119.8, schedule), 120)
