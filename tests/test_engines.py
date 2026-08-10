@@ -197,8 +197,19 @@ class RenderingTests(unittest.TestCase):
             TicTacToeEngine(),
             ReversiEngine(),
         ]
+        first_moves = {
+            "chess": "e4",
+            "go": "D4",
+            "xiangqi": "h2e2",
+            "gomoku": "G7",
+            "tictactoe": "5",
+            "reversi": "D3",
+        }
         for engine in engines:
             with self.subTest(engine=engine.game_id):
+                outcome = engine.play(first_moves[engine.game_id])
+                self.assertTrue(outcome.ok, outcome.message)
+                self.assertEqual(engine.turn, SECOND)
                 session = GameSession(
                     "test",
                     engine.game_id,

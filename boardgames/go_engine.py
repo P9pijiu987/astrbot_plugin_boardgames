@@ -211,7 +211,7 @@ class GoEngine(GameEngine):
                 if black == white:
                     return MoveOutcome(
                         True,
-                        f"双方连续停一手。数子结果 黑 {black:g} : 白 {white:g}，和棋。",
+                        f"双方连续停一手。规则面积数子（非 AI）黑 {black:g} : 白 {white:g}，分数完全相等，和棋。",
                         notation,
                         ended=True,
                         draw=True,
@@ -219,7 +219,7 @@ class GoEngine(GameEngine):
                 winner = FIRST if black > white else SECOND
                 return MoveOutcome(
                     True,
-                    f"双方连续停一手。数子结果 黑 {black:g} : 白 {white:g}。",
+                    f"双方连续停一手。规则面积数子（非 AI）黑 {black:g} : 白 {white:g}。",
                     notation,
                     ended=True,
                     winner=winner,
