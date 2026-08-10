@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import types
@@ -48,6 +49,15 @@ class _Logger:
         return lambda *_args, **_kwargs: None
 
 
+class _MessageChain:
+    def __init__(self):
+        self.text = ""
+
+    def message(self, text):
+        self.text = text
+        return self
+
+
 astrbot = types.ModuleType("astrbot")
 api = types.ModuleType("astrbot.api")
 event = types.ModuleType("astrbot.api.event")
@@ -57,7 +67,7 @@ api.AstrBotConfig = dict
 api.logger = _Logger()
 event.AstrMessageEvent = object
 event.filter = _Filter()
-event.MessageChain = object
+event.MessageChain = _MessageChain
 star.Context = object
 star.Star = _Star
 components.Image = _Image
@@ -127,6 +137,18 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(joined[0][0], "chain")
         self.assertEqual(len(joined[0][1]), 1)
 
+        selected = await _collect(plugin.choose_first(starter))
+        self.assertEqual(selected[0][0], "chain")
+        session = plugin.store.get(starter.unified_msg_origin)
+        self.assertEqual(session.status, "choosing")
+        conflict = await _collect(plugin.choose_first(joiner))
+        self.assertEqual(conflict[0][0], "plain")
+        self.assertIn("已经选择", conflict[0][1])
+        selected = await _collect(plugin.choose_second(joiner))
+        self.assertEqual(selected[0][0], "chain")
+        self.assertEqual(session.status, "playing")
+        self.assertTrue(session.clock["running"])
+
         move = _Event("1", "甲", "Nc3")
         moved = await _collect(plugin.receive_bare_move(move))
         self.assertTrue(move.stopped)
@@ -145,6 +167,8 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         joiner = _Event("2", "乙")
         await _collect(plugin.start_game(starter, "围棋", "9路"))
         await _collect(plugin.join_game(joiner))
+        await _collect(plugin.choose_first(starter))
+        await _collect(plugin.choose_second(joiner))
         await _collect(plugin.request_analysis(starter))
         results = await _collect(plugin.agree_analysis(joiner))
         self.assertEqual(results[0][0], "plain")
@@ -169,12 +193,48 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added[0][0], "chain")
         for move in ("G8", "G9"):
             await _collect(plugin.receive_bare_move(_Event("2", "乙", move)))
-        chosen = await _collect(plugin.swap2_choose_white(starter))
+        chosen = await _collect(plugin.choose_white(starter))
         self.assertEqual(chosen[0][0], "chain")
         session = plugin.store.get(starter.unified_msg_origin)
         self.assertEqual(session.players["second"].user_id, "1")
         self.assertEqual(session.players["first"].user_id, "2")
         self.assertEqual(session.engine.turn, "second")
+        await plugin.terminate()
+
+    async def test_explicit_no_clock_survives_persistence(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        context = SimpleNamespace(send_message=lambda *_args, **_kwargs: None)
+        plugin = module.BoardGamesPlugin(context, {})
+        starter = _Event("1", "甲")
+        await _collect(plugin.start_game(starter, "黑白棋", "不计时"))
+        session = plugin.store.get(starter.unified_msg_origin)
+        self.assertIsNone(session.clock)
+        self.assertTrue(session.clock_disabled)
+        restored = module.SessionStore()
+        self.assertEqual(restored.restore(plugin.store.to_dict()), [])
+        restored_session = restored.get(starter.unified_msg_origin)
+        self.assertIsNone(restored_session.clock)
+        self.assertTrue(restored_session.clock_disabled)
+        await plugin.terminate()
+
+    async def test_running_clock_automatically_records_timeout(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        sent = []
+
+        async def send_message(key, chain):
+            sent.append((key, chain))
+
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=send_message), {})
+        starter = _Event("1", "甲")
+        joiner = _Event("2", "乙")
+        await _collect(plugin.start_game(starter, "井字棋", "计时=0.001"))
+        await _collect(plugin.join_game(joiner))
+        await _collect(plugin.choose_first(starter))
+        await _collect(plugin.choose_second(joiner))
+        await asyncio.sleep(1.15)
+        self.assertIsNone(plugin.store.get(starter.unified_msg_origin))
+        self.assertEqual(plugin.stats["2"]["tictactoe"]["wins"], 1)
+        self.assertTrue(sent)
         await plugin.terminate()
 
 

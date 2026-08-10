@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .base import FIRST, SECOND
 from .chess_engine import ChessEngine
+from .clock import format_clock
 from .go_engine import _GO_LETTERS, GoEngine
 from .grid_games import GomokuEngine, ReversiEngine, TicTacToeEngine
 from .session import GameSession
@@ -38,14 +39,17 @@ class BoardRenderer:
         draw.text((32, 20), session.engine.display_name, font=title_font, fill=self.INK)
         side = session.engine.turn
         side_name = session.engine.side_names[0 if side == FIRST else 1]
-        if (
+        if session.status == "choosing":
+            status = "等待双方强制选色"
+        elif (
             session.status == "playing"
             and isinstance(session.engine, GomokuEngine)
             and session.engine.opening_prompt
         ):
             status = f"Swap2 · {session.engine.opening_prompt}"
         elif session.status == "waiting":
-            status = f"等待加入 · {side_name}"
+            control = session.clock.get("label") if session.clock else "不计时"
+            status = f"等待加入 · 用时 {control}"
         else:
             in_check = (
                 isinstance(session.engine, ChessEngine)
@@ -54,21 +58,57 @@ class BoardRenderer:
                 isinstance(session.engine, XiangqiEngine)
                 and session.engine._in_check(session.engine.turn)
             )
-            status = f"轮到 {side_name}" + (" · 将军" if in_check else "")
+            status = (
+                f"轮到 {side_name} · {side_name}视角"
+                + (" · 将军" if in_check else "")
+            )
         draw.text((728, 27), status, font=info_font, fill="#555555", anchor="ra")
         first = session.players.get(FIRST)
         second = session.players.get(SECOND)
+        if session.status == "choosing":
+            first_choice = session.side_choices.get(first.user_id) if first else None
+            second_choice = session.side_choices.get(second.user_id) if second else None
+
+            def choice_text(choice: str | None) -> str:
+                if not choice:
+                    return "未选"
+                return session.engine.side_names[0 if choice == FIRST else 1]
+
+            draw.text(
+                (32, 68),
+                f"玩家  {first.name if first else '—'} · {choice_text(first_choice)}",
+                font=info_font,
+                fill="#9C2F2F",
+            )
+            draw.text(
+                (728, 68),
+                f"玩家  {second.name if second else '—'} · {choice_text(second_choice)}",
+                font=info_font,
+                fill="#333333",
+                anchor="ra",
+            )
+            return
         first_name = first.name if first else "等待加入"
         second_name = second.name if second else "等待加入"
+        first_clock = (
+            f"  ⏱ {format_clock(session.clock, FIRST)}"
+            if session.status == "playing"
+            else ""
+        )
+        second_clock = (
+            f"  ⏱ {format_clock(session.clock, SECOND)}"
+            if session.status == "playing"
+            else ""
+        )
         draw.text(
             (32, 68),
-            f"{session.engine.side_names[0]}  {first_name}",
+            f"{session.engine.side_names[0]}  {first_name}{first_clock}",
             font=info_font,
             fill="#9C2F2F",
         )
         draw.text(
             (728, 68),
-            f"{session.engine.side_names[1]}  {second_name}",
+            f"{session.engine.side_names[1]}  {second_name}{second_clock}",
             font=info_font,
             fill="#333333",
             anchor="ra",
@@ -78,6 +118,21 @@ class BoardRenderer:
         self, draw: ImageDraw.ImageDraw, height: int, session: GameSession
     ) -> None:
         font = self._font(16)
+        if session.status == "choosing":
+            draw.text(
+                (32, height - 40),
+                "双方必须分别选择不同棋色",
+                font=font,
+                fill="#666666",
+            )
+            draw.text(
+                (728, height - 40),
+                "使用 /选先 /选后，或 /选白 /选黑 /选红",
+                font=font,
+                fill="#666666",
+                anchor="ra",
+            )
+            return
         if session.status == "waiting":
             draw.text(
                 (32, height - 40),
@@ -117,6 +172,18 @@ class BoardRenderer:
     ) -> None:
         draw.rectangle(rect, outline=color, width=6)
 
+    @staticmethod
+    def _flipped(session: GameSession) -> bool:
+        return session.status == "playing" and session.engine.turn == SECOND
+
+    @staticmethod
+    def _oriented_point(
+        x: int, y: int, width: int, height: int, flipped: bool
+    ) -> tuple[int, int]:
+        if flipped:
+            return width - 1 - x, height - 1 - y
+        return x, y
+
     def render(self, session: GameSession) -> bytes:
         engine = session.engine
         if isinstance(engine, ChessEngine):
@@ -152,6 +219,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         coord_font = self._font(16)
         piece_font = self._font(49, pieces=True)
         symbols = {
@@ -173,7 +241,9 @@ class BoardRenderer:
                 x0, y0 = left + col * cell, top + row * cell
                 color = "#F0D9B5" if (row + col) % 2 == 0 else "#B58863"
                 draw.rectangle((x0, y0, x0 + cell, y0 + cell), fill=color)
-                square = __import__("chess").square(col, 7 - row)
+                file_index = 7 - col if flipped else col
+                rank_index = row if flipped else 7 - row
+                square = __import__("chess").square(file_index, rank_index)
                 piece = engine.board.piece_at(square)
                 if piece:
                     draw.text(
@@ -188,31 +258,50 @@ class BoardRenderer:
             for pos, color in ((origin, self.ORIGIN), (target, self.TARGET)):
                 if pos:
                     x, rank = pos
-                    row = 7 - rank
+                    view_x, view_rank = self._oriented_point(
+                        x, rank, 8, 8, flipped
+                    )
+                    row = 7 - view_rank
                     self._highlight_rect(
                         draw,
                         (
-                            left + x * cell + 3,
+                            left + view_x * cell + 3,
                             top + row * cell + 3,
-                            left + (x + 1) * cell - 3,
+                            left + (view_x + 1) * cell - 3,
                             top + (row + 1) * cell - 3,
                         ),
                         color,
                     )
         for i in range(8):
+            file_label = chr(97 + (7 - i if flipped else i))
+            rank_label = str((i + 1) if flipped else (8 - i))
             draw.text(
                 (left + i * cell + cell / 2, top + board_size + 8),
-                chr(97 + i),
+                file_label,
                 font=coord_font,
                 fill=self.INK,
-                anchor="ma",
+                anchor="mm",
+            )
+            draw.text(
+                (left + i * cell + cell / 2, top - 12),
+                file_label,
+                font=coord_font,
+                fill=self.INK,
+                anchor="mm",
             )
             draw.text(
                 (left - 12, top + i * cell + cell / 2),
-                str(8 - i),
+                rank_label,
                 font=coord_font,
                 fill=self.INK,
                 anchor="rm",
+            )
+            draw.text(
+                (left + board_size + 12, top + i * cell + cell / 2),
+                rank_label,
+                font=coord_font,
+                fill=self.INK,
+                anchor="lm",
             )
         self._footer(draw, height, session)
         return image
@@ -226,6 +315,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         draw.rectangle(
             (left - 32, top - 32, left + width + 32, top + board_height + 32),
             fill="#E9C887",
@@ -265,16 +355,17 @@ class BoardRenderer:
             width=2,
         )
         river_font = self._font(26)
+        left_river, right_river = ("汉 界", "楚 河") if flipped else ("楚 河", "汉 界")
         draw.text(
             (left + 1.5 * cell, top + 4.5 * cell),
-            "楚 河",
+            left_river,
             font=river_font,
             fill="#6B4423",
             anchor="mm",
         )
         draw.text(
             (left + 6.5 * cell, top + 4.5 * cell),
-            "汉 界",
+            right_river,
             font=river_font,
             fill="#6B4423",
             anchor="mm",
@@ -285,7 +376,8 @@ class BoardRenderer:
                 piece = engine.board[y][x]
                 if not piece:
                     continue
-                px, py = left + x * cell, top + (9 - y) * cell
+                view_x, view_y = self._oriented_point(x, y, 9, 10, flipped)
+                px, py = left + view_x * cell, top + (9 - view_y) * cell
                 fill = "#F7E1A8"
                 outline = "#B43B32" if piece.isupper() else "#333333"
                 draw.ellipse(
@@ -306,23 +398,42 @@ class BoardRenderer:
             for pos, color in ((origin, self.ORIGIN), (target, self.TARGET)):
                 if pos:
                     x, y = pos
-                    px, py = left + x * cell, top + (9 - y) * cell
+                    view_x, view_y = self._oriented_point(x, y, 9, 10, flipped)
+                    px, py = left + view_x * cell, top + (9 - view_y) * cell
                     draw.ellipse(
                         (px - 29, py - 29, px + 29, py + 29), outline=color, width=6
                     )
         coord_font = self._font(15)
-        for x in range(9):
+        for screen_x in range(9):
+            logical_x = 8 - screen_x if flipped else screen_x
+            label = chr(97 + logical_x)
             draw.text(
-                (left + x * cell, top + board_height + 40),
-                chr(97 + x),
+                (left + screen_x * cell, top + board_height + 40),
+                label,
                 font=coord_font,
                 fill="#684420",
                 anchor="mm",
             )
-        for y in range(10):
             draw.text(
-                (left - 42, top + (9 - y) * cell),
-                str(y),
+                (left + screen_x * cell, top - 40),
+                label,
+                font=coord_font,
+                fill="#684420",
+                anchor="mm",
+            )
+        for screen_row in range(10):
+            logical_y = screen_row if flipped else 9 - screen_row
+            label = str(logical_y)
+            draw.text(
+                (left - 42, top + screen_row * cell),
+                label,
+                font=coord_font,
+                fill="#684420",
+                anchor="mm",
+            )
+            draw.text(
+                (left + width + 42, top + screen_row * cell),
+                label,
                 font=coord_font,
                 fill="#684420",
                 anchor="mm",
@@ -349,6 +460,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         draw.rectangle(
             (left - cell, top - cell, left + extent + cell, top + extent + cell),
             fill="#D9A85B",
@@ -367,8 +479,11 @@ class BoardRenderer:
                         continue
                     tint = (55, 48, 42) if value > 0 else (205, 232, 244)
                     color = self._mix_color(base, tint, min(0.78, abs(value) * 0.72))
-                    px = left + x * cell
-                    py = top + (engine.size - 1 - y) * cell
+                    view_x, view_y = self._oriented_point(
+                        x, y, engine.size, engine.size, flipped
+                    )
+                    px = left + view_x * cell
+                    py = top + (engine.size - 1 - view_y) * cell
                     radius = max(5, cell * 0.43)
                     draw.rectangle(
                         (px - radius, py - radius, px + radius, py + radius),
@@ -402,7 +517,11 @@ class BoardRenderer:
                 stone = engine.board[y][x]
                 if not stone:
                     continue
-                px, py = left + x * cell, top + (engine.size - 1 - y) * cell
+                view_x, view_y = self._oriented_point(
+                    x, y, engine.size, engine.size, flipped
+                )
+                px = left + view_x * cell
+                py = top + (engine.size - 1 - view_y) * cell
                 fill, outline = (
                     ("#171717", "#000000") if stone == 1 else ("#F7F7F7", "#555555")
                 )
@@ -415,7 +534,11 @@ class BoardRenderer:
                 )
         if engine.last_move and engine.last_move[1]:
             x, y = engine.last_move[1]
-            px, py = left + x * cell, top + (engine.size - 1 - y) * cell
+            view_x, view_y = self._oriented_point(
+                x, y, engine.size, engine.size, flipped
+            )
+            px = left + view_x * cell
+            py = top + (engine.size - 1 - view_y) * cell
             draw.ellipse(
                 (
                     px - cell * 0.18,
@@ -427,17 +550,34 @@ class BoardRenderer:
                 width=4,
             )
         coord_font = self._font(14)
-        for i in range(engine.size):
+        for screen_i in range(engine.size):
+            logical_i = engine.size - 1 - screen_i if flipped else screen_i
+            letter = _GO_LETTERS[logical_i]
+            number = str((screen_i + 1) if flipped else (engine.size - screen_i))
             draw.text(
-                (left + i * cell, top + extent + cell * 0.65),
-                _GO_LETTERS[i],
+                (left + screen_i * cell, top + extent + cell * 0.65),
+                letter,
                 font=coord_font,
                 fill=self.INK,
                 anchor="mm",
             )
             draw.text(
-                (left - cell * 0.65, top + (engine.size - 1 - i) * cell),
-                str(i + 1),
+                (left + screen_i * cell, top - cell * 0.65),
+                letter,
+                font=coord_font,
+                fill=self.INK,
+                anchor="mm",
+            )
+            draw.text(
+                (left - cell * 0.65, top + screen_i * cell),
+                number,
+                font=coord_font,
+                fill=self.INK,
+                anchor="mm",
+            )
+            draw.text(
+                (left + extent + cell * 0.65, top + screen_i * cell),
+                number,
                 font=coord_font,
                 fill=self.INK,
                 anchor="mm",
@@ -463,6 +603,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         draw.rectangle(
             (left - cell, top - cell, left + extent + cell, top + extent + cell),
             fill="#D9A85B",
@@ -481,7 +622,11 @@ class BoardRenderer:
                 stone = engine.board[y][x]
                 if not stone:
                     continue
-                px, py = left + x * cell, top + (engine.size - 1 - y) * cell
+                view_x, view_y = self._oriented_point(
+                    x, y, engine.size, engine.size, flipped
+                )
+                px = left + view_x * cell
+                py = top + (engine.size - 1 - view_y) * cell
                 fill, outline = (
                     ("#151515", "#000") if stone == 1 else ("#FAFAFA", "#666")
                 )
@@ -494,7 +639,11 @@ class BoardRenderer:
                 )
         if engine.last_move and engine.last_move[1]:
             x, y = engine.last_move[1]
-            px, py = left + x * cell, top + (engine.size - 1 - y) * cell
+            view_x, view_y = self._oriented_point(
+                x, y, engine.size, engine.size, flipped
+            )
+            px = left + view_x * cell
+            py = top + (engine.size - 1 - view_y) * cell
             draw.ellipse(
                 (
                     px - cell * 0.16,
@@ -506,17 +655,34 @@ class BoardRenderer:
                 width=4,
             )
         coord_font = self._font(14)
-        for i in range(engine.size):
+        for screen_i in range(engine.size):
+            logical_i = engine.size - 1 - screen_i if flipped else screen_i
+            letter = chr(65 + logical_i)
+            number = str((screen_i + 1) if flipped else (engine.size - screen_i))
             draw.text(
-                (left + i * cell, top + extent + cell * 0.65),
-                chr(65 + i),
+                (left + screen_i * cell, top + extent + cell * 0.65),
+                letter,
                 font=coord_font,
                 fill=self.INK,
                 anchor="mm",
             )
             draw.text(
-                (left - cell * 0.65, top + (engine.size - 1 - i) * cell),
-                str(i + 1),
+                (left + screen_i * cell, top - cell * 0.65),
+                letter,
+                font=coord_font,
+                fill=self.INK,
+                anchor="mm",
+            )
+            draw.text(
+                (left - cell * 0.65, top + screen_i * cell),
+                number,
+                font=coord_font,
+                fill=self.INK,
+                anchor="mm",
+            )
+            draw.text(
+                (left + extent + cell * 0.65, top + screen_i * cell),
+                number,
                 font=coord_font,
                 fill=self.INK,
                 anchor="mm",
@@ -543,6 +709,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         for y in range(8):
             for x in range(8):
                 x0, y0 = left + x * cell, top + y * cell
@@ -552,7 +719,8 @@ class BoardRenderer:
                     outline="#173B25",
                     width=2,
                 )
-                stone = engine.board[y][x]
+                logical_x, logical_y = self._oriented_point(x, y, 8, 8, flipped)
+                stone = engine.board[logical_y][logical_x]
                 if stone:
                     fill, outline = (
                         ("#171717", "#000") if stone == 1 else ("#F7F7F7", "#777")
@@ -565,6 +733,7 @@ class BoardRenderer:
                     )
         if engine.last_move and engine.last_move[1]:
             x, y = engine.last_move[1]
+            x, y = self._oriented_point(x, y, 8, 8, flipped)
             self._highlight_rect(
                 draw,
                 (
@@ -577,19 +746,34 @@ class BoardRenderer:
             )
         font = self._font(15)
         for i in range(8):
+            logical_i = 7 - i if flipped else i
             draw.text(
                 (left + i * cell + cell / 2, top + size + 8),
-                chr(65 + i),
+                chr(65 + logical_i),
                 font=font,
                 fill=self.INK,
                 anchor="ma",
             )
             draw.text(
                 (left - 12, top + i * cell + cell / 2),
-                str(i + 1),
+                str(logical_i + 1),
                 font=font,
                 fill=self.INK,
                 anchor="rm",
+            )
+            draw.text(
+                (left + i * cell + cell / 2, top - 8),
+                chr(65 + logical_i),
+                font=font,
+                fill=self.INK,
+                anchor="md",
+            )
+            draw.text(
+                (left + size + 12, top + i * cell + cell / 2),
+                str(logical_i + 1),
+                font=font,
+                fill=self.INK,
+                anchor="lm",
             )
         self._footer(draw, height, session)
         return image
@@ -603,6 +787,7 @@ class BoardRenderer:
         image = Image.new("RGB", (self.WIDTH, height), self.BG)
         draw = ImageDraw.Draw(image)
         self._header(draw, session)
+        flipped = self._flipped(session)
         for i in (1, 2):
             draw.line(
                 (left + i * cell, top, left + i * cell, top + size),
@@ -617,7 +802,8 @@ class BoardRenderer:
         font = self._font(105)
         for y in range(3):
             for x in range(3):
-                value = engine.board[y][x]
+                logical_x, logical_y = self._oriented_point(x, y, 3, 3, flipped)
+                value = engine.board[logical_y][logical_x]
                 if value:
                     draw.text(
                         (left + x * cell + cell / 2, top + y * cell + cell / 2),
@@ -628,12 +814,13 @@ class BoardRenderer:
                     )
                 draw.text(
                     (left + x * cell + 18, top + y * cell + 12),
-                    str(y * 3 + x + 1),
+                    str(logical_y * 3 + logical_x + 1),
                     font=self._font(16),
                     fill="#888",
                 )
         if engine.last_move and engine.last_move[1]:
             x, y = engine.last_move[1]
+            x, y = self._oriented_point(x, y, 3, 3, flipped)
             self._highlight_rect(
                 draw,
                 (
@@ -643,6 +830,37 @@ class BoardRenderer:
                     top + (y + 1) * cell - 5,
                 ),
                 self.TARGET,
+            )
+        coord_font = self._font(15)
+        for i in range(3):
+            logical_i = 2 - i if flipped else i
+            draw.text(
+                (left + i * cell + cell / 2, top - 12),
+                chr(65 + logical_i),
+                font=coord_font,
+                fill=self.INK,
+                anchor="md",
+            )
+            draw.text(
+                (left + i * cell + cell / 2, top + size + 12),
+                chr(65 + logical_i),
+                font=coord_font,
+                fill=self.INK,
+                anchor="ma",
+            )
+            draw.text(
+                (left - 12, top + i * cell + cell / 2),
+                str(logical_i + 1),
+                font=coord_font,
+                fill=self.INK,
+                anchor="rm",
+            )
+            draw.text(
+                (left + size + 12, top + i * cell + cell / 2),
+                str(logical_i + 1),
+                font=coord_font,
+                fill=self.INK,
+                anchor="lm",
             )
         self._footer(draw, height, session)
         return image

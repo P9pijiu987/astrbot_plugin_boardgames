@@ -32,6 +32,9 @@ class GameSession:
     created_at: float = field(default_factory=time.time)
     last_action_at: float = field(default_factory=time.time)
     pending: dict[str, Any] | None = None
+    side_choices: dict[str, str] = field(default_factory=dict)
+    clock: dict[str, Any] | None = None
+    clock_disabled: bool = False
 
     def side_for(self, user_id: str) -> str | None:
         uid = str(user_id)
@@ -57,6 +60,9 @@ class GameSession:
             "created_at": self.created_at,
             "last_action_at": self.last_action_at,
             "pending": self.pending,
+            "side_choices": dict(self.side_choices),
+            "clock": self.clock,
+            "clock_disabled": self.clock_disabled,
         }
 
     @classmethod
@@ -76,6 +82,12 @@ class GameSession:
             created_at=float(data.get("created_at", time.time())),
             last_action_at=float(data.get("last_action_at", time.time())),
             pending=data.get("pending"),
+            side_choices={
+                str(user_id): str(side)
+                for user_id, side in dict(data.get("side_choices", {})).items()
+            },
+            clock=dict(data["clock"]) if data.get("clock") else None,
+            clock_disabled=bool(data.get("clock_disabled", False)),
         )
 
 

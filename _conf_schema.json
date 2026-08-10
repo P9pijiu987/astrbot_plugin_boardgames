@@ -13,12 +13,55 @@
   },
   "waiting_timeout_minutes": {
     "type": "int",
-    "description": "等待第二位玩家加入的超时分钟数",
+    "description": "等待第二位玩家加入并完成选边的超时分钟数",
     "default": 10
+  },
+  "enable_clocks": {
+    "type": "bool",
+    "description": "默认启用比赛棋钟、超时自动判负和分级提醒",
+    "default": true
+  },
+  "clock_chess": {
+    "type": "string",
+    "description": "国际象棋默认用时",
+    "hint": "15+10 表示每方15分钟、每步加10秒。也可在开局时用 计时= 覆盖。",
+    "default": "15+10"
+  },
+  "clock_go": {
+    "type": "string",
+    "description": "围棋默认用时",
+    "hint": "20|3x30 表示每方20分钟基本用时，随后3次30秒读秒。",
+    "default": "20|3x30"
+  },
+  "clock_xiangqi": {
+    "type": "string",
+    "description": "中国象棋默认用时",
+    "default": "10+5"
+  },
+  "clock_gomoku": {
+    "type": "string",
+    "description": "五子棋默认用时",
+    "default": "20+3"
+  },
+  "clock_tictactoe": {
+    "type": "string",
+    "description": "井字棋默认用时",
+    "default": "2+2"
+  },
+  "clock_reversi": {
+    "type": "string",
+    "description": "黑白棋默认用时",
+    "default": "10"
+  },
+  "clock_reminder_schedule": {
+    "type": "string",
+    "description": "棋钟剩余时间提醒档位",
+    "hint": "格式为 阈值秒:间隔秒，以逗号分隔。默认表示5分钟内每60秒、2分钟内每30秒、1分钟内每10秒、30秒内每5秒提醒。",
+    "default": "300:60,120:30,60:10,30:5"
   },
   "turn_timeout_minutes": {
     "type": "int",
-    "description": "允许使用 /强制胜利 的单步超时分钟数",
+    "description": "关闭比赛棋钟时，允许使用 /强制胜利 的单步超时分钟数",
     "default": 10
   },
   "go_komi": {
