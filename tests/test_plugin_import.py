@@ -50,12 +50,19 @@ class _Logger:
 
 
 class _MessageChain:
-    def __init__(self):
+    def __init__(self, chain=None):
         self.text = ""
+        self.chain = list(chain or [])
 
     def message(self, text):
         self.text = text
         return self
+
+
+class _At:
+    def __init__(self, qq: str, name: str = ""):
+        self.qq = qq
+        self.name = name
 
 
 astrbot = types.ModuleType("astrbot")
@@ -89,6 +96,16 @@ class PluginImportTests(unittest.TestCase):
         self.assertTrue(callable(plugin.start_game))
         self.assertTrue(callable(plugin.receive_bare_move))
         self.assertTrue(callable(plugin.agree_analysis))
+        for handler in (
+            "move_help",
+            "chess_help",
+            "go_help",
+            "xiangqi_help",
+            "gomoku_help",
+            "tictactoe_help",
+            "reversi_help",
+        ):
+            self.assertTrue(callable(getattr(plugin, handler)))
 
 
 class _Event:
@@ -96,7 +113,13 @@ class _Event:
         self._user_id = user_id
         self._name = name
         self.message_str = message
-        self.message_obj = SimpleNamespace(group_id="100")
+        self.message_obj = SimpleNamespace(
+            group_id="100",
+            message=[],
+            self_id="bot",
+            raw_message=None,
+            sender=None,
+        )
         self.unified_msg_origin = "test:group:100"
         self.stopped = False
 
@@ -139,14 +162,13 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
 
         selected = await _collect(plugin.choose_first(starter))
         self.assertEqual(selected[0][0], "chain")
+        self.assertEqual(selected[1][0], "chain")
+        self.assertEqual(selected[2][0], "plain")
+        self.assertIn("本局用时", selected[2][1])
         session = plugin.store.get(starter.unified_msg_origin)
-        self.assertEqual(session.status, "choosing")
-        conflict = await _collect(plugin.choose_first(joiner))
-        self.assertEqual(conflict[0][0], "plain")
-        self.assertIn("已经选择", conflict[0][1])
-        selected = await _collect(plugin.choose_second(joiner))
-        self.assertEqual(selected[0][0], "chain")
         self.assertEqual(session.status, "playing")
+        self.assertEqual(session.players["first"].user_id, "1")
+        self.assertEqual(session.players["second"].user_id, "2")
         self.assertTrue(session.clock["running"])
 
         move = _Event("1", "甲", "Nc3")
@@ -166,9 +188,12 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         starter = _Event("1", "甲")
         joiner = _Event("2", "乙")
         await _collect(plugin.start_game(starter, "围棋", "9路"))
+        self.assertEqual(
+            plugin.store.get(starter.unified_msg_origin).clock["label"],
+            "60|3x30",
+        )
         await _collect(plugin.join_game(joiner))
         await _collect(plugin.choose_first(starter))
-        await _collect(plugin.choose_second(joiner))
         await _collect(plugin.request_analysis(starter))
         results = await _collect(plugin.agree_analysis(joiner))
         self.assertEqual(results[0][0], "plain")
@@ -230,11 +255,82 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         await _collect(plugin.start_game(starter, "井字棋", "计时=0.001"))
         await _collect(plugin.join_game(joiner))
         await _collect(plugin.choose_first(starter))
-        await _collect(plugin.choose_second(joiner))
         await asyncio.sleep(1.15)
         self.assertIsNone(plugin.store.get(starter.unified_msg_origin))
         self.assertEqual(plugin.stats["2"]["tictactoe"]["wins"], 1)
         self.assertTrue(sent)
+        await plugin.terminate()
+
+    async def test_anyone_can_abort_an_unjoined_room(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
+        starter = _Event("1", "甲")
+        outsider = _Event("3", "路人")
+        await _collect(plugin.start_game(starter, "围棋"))
+        results = await _collect(plugin.abort_game(outsider))
+        self.assertIn("空房已取消", results[0][1])
+        self.assertIsNone(plugin.store.get(starter.unified_msg_origin))
+        await plugin.terminate()
+
+    async def test_history_supports_mention_and_game_filter(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
+        plugin.stats = {
+            "2": {
+                "go": {
+                    "player_name": "乙",
+                    "wins": 3,
+                    "draws": 1,
+                    "losses": 1,
+                    "rating": 1042,
+                    "history": [
+                        {
+                            "time": 1_700_000_000,
+                            "result": "win",
+                            "opponent_name": "甲",
+                            "reason": "rules",
+                            "moves": 120,
+                            "duration_seconds": 3600,
+                            "rating_before": 1026,
+                            "rating_after": 1042,
+                            "time_control": "60|3x30",
+                        }
+                    ],
+                }
+            }
+        }
+        event = _Event("3", "查询者")
+        event.message_obj.message = [_At("2", "乙")]
+        results = await _collect(plugin.show_history(event, "围棋"))
+        self.assertIn("乙 · 围棋对局记录", results[0][1])
+        self.assertIn("3胜 1和 1负", results[0][1])
+        self.assertIn("胜率 60.0%", results[0][1])
+        self.assertIn("最近 10 局", results[0][1])
+        await plugin.terminate()
+
+    async def test_resignation_sends_result_card_before_text(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
+        starter = _Event("1", "甲")
+        joiner = _Event("2", "乙")
+        await _collect(plugin.start_game(starter, "国际象棋"))
+        await _collect(plugin.join_game(joiner))
+        await _collect(plugin.choose_first(starter))
+        results = await _collect(plugin.resign(starter))
+        self.assertEqual(results[0][0], "chain")
+        self.assertEqual(results[0][1][0][0], "image")
+        self.assertEqual(results[1][0], "plain")
+        await plugin.terminate()
+
+    async def test_game_specific_and_move_help_are_distinct(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
+        event = _Event("1", "甲")
+        move_help = await _collect(plugin.move_help(event))
+        go_help = await _collect(plugin.go_help(event))
+        self.assertIn("/下棋 Nc3", move_help[0][1])
+        self.assertIn("默认标准 19 路、60|3x30", go_help[0][1])
+        self.assertIn("面积数子", go_help[0][1])
         await plugin.terminate()
 
 

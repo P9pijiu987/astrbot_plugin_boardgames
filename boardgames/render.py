@@ -3,14 +3,14 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .base import FIRST, SECOND
 from .chess_engine import ChessEngine
 from .clock import format_clock
 from .go_engine import _GO_LETTERS, GoEngine
 from .grid_games import GomokuEngine, ReversiEngine, TicTacToeEngine
-from .session import GameSession
+from .session import GameSession, Player
 from .xiangqi_engine import _PIECE_NAMES, XiangqiEngine
 
 
@@ -40,7 +40,7 @@ class BoardRenderer:
         side = session.engine.turn
         side_name = session.engine.side_names[0 if side == FIRST else 1]
         if session.status == "choosing":
-            status = "等待双方强制选色"
+            status = "等待任一选手选色"
         elif (
             session.status == "playing"
             and isinstance(session.engine, GomokuEngine)
@@ -121,13 +121,13 @@ class BoardRenderer:
         if session.status == "choosing":
             draw.text(
                 (32, height - 40),
-                "双方必须分别选择不同棋色",
+                "任一选手选择一方，对手自动分配另一方",
                 font=font,
                 fill="#666666",
             )
             draw.text(
                 (728, height - 40),
-                "使用 /选先 /选后，或 /选白 /选黑 /选红",
+                "使用 /选先 /选后，或对应棋种的 /选白 /选黑 /选红",
                 font=font,
                 fill="#666666",
                 anchor="ra",
@@ -208,6 +208,227 @@ class BoardRenderer:
         if not isinstance(session.engine, GoEngine):
             raise TypeError("势力范围图仅适用于围棋")
         image = self._render_go(session, session.engine, show_influence=True)
+        stream = io.BytesIO()
+        image.save(stream, format="PNG", optimize=True)
+        return stream.getvalue()
+
+    @staticmethod
+    def _game_record(
+        stats: dict, player: Player | None, game_id: str
+    ) -> dict:
+        if not player:
+            return {}
+        return dict(stats.get(player.user_id, {}).get(game_id, {}))
+
+    @staticmethod
+    def _totals(stats: dict, player: Player | None) -> tuple[int, int, int]:
+        wins = draws = losses = 0
+        if player:
+            for record in stats.get(player.user_id, {}).values():
+                wins += int(record.get("wins", 0))
+                draws += int(record.get("draws", 0))
+                losses += int(record.get("losses", 0))
+        return wins, draws, losses
+
+    @staticmethod
+    def _h2h(stats: dict, player: Player | None, rival: Player | None, game_id=None):
+        wins = draws = losses = 0
+        if not player or not rival:
+            return wins, draws, losses
+        games = stats.get(player.user_id, {})
+        for current_game, record in games.items():
+            if game_id and current_game != game_id:
+                continue
+            for item in record.get("history", []):
+                if str(item.get("opponent_id", "")) != rival.user_id:
+                    continue
+                result = item.get("result")
+                wins += result == "win"
+                draws += result == "draw"
+                losses += result == "loss"
+        return int(wins), int(draws), int(losses)
+
+    @staticmethod
+    def _rate(wins: int, draws: int, losses: int) -> str:
+        total = wins + draws + losses
+        return f"{wins / total * 100:.1f}%" if total else "—"
+
+    def _draw_avatar(
+        self,
+        image: Image.Image,
+        player: Player | None,
+        data: bytes | None,
+        center: tuple[int, int],
+        size: int,
+        color: str,
+    ) -> None:
+        left, top = center[0] - size // 2, center[1] - size // 2
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        avatar = None
+        if data:
+            try:
+                avatar = Image.open(io.BytesIO(data)).convert("RGB")
+                avatar = ImageOps.fit(avatar, (size, size), method=Image.Resampling.LANCZOS)
+            except Exception:  # noqa: BLE001 - malformed avatar uses initials
+                avatar = None
+        if avatar is None:
+            avatar = Image.new("RGB", (size, size), color)
+            draw = ImageDraw.Draw(avatar)
+            initial = (player.name.strip()[:1] if player else "?") or "?"
+            draw.text(
+                (size / 2, size / 2 - 2),
+                initial,
+                font=self._font(size // 2),
+                fill="#FFFFFF",
+                anchor="mm",
+            )
+        image.paste(avatar, (left, top), mask)
+        ImageDraw.Draw(image).ellipse(
+            (left - 3, top - 3, left + size + 2, top + size + 2),
+            outline=color,
+            width=5,
+        )
+
+    def _game_detail(self, session: GameSession) -> str:
+        engine = session.engine
+        if isinstance(engine, GoEngine):
+            return f"{engine.size} 路 · 白贴 {engine.komi:g} 目"
+        if isinstance(engine, GomokuEngine):
+            opening = " · Swap2" if engine.opening == "swap2" else ""
+            return f"{engine.size} 路 · {engine.rule_label}{opening}"
+        return "标准规则"
+
+    def render_match_card(
+        self,
+        session: GameSession,
+        stats: dict,
+        avatars: dict[str, bytes | None],
+    ) -> bytes:
+        image = Image.new("RGB", (self.WIDTH, 650), "#F2EEE5")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(
+            (24, 24, 736, 626), radius=28, fill="#FFFDF8", outline="#D8CDBA", width=3
+        )
+        draw.text((380, 58), "对局成立", font=self._font(34), fill=self.INK, anchor="mm")
+        control = session.clock.get("label") if session.clock else "不计时"
+        draw.text(
+            (380, 100),
+            f"{session.engine.display_name} · {self._game_detail(session)} · 用时 {control}",
+            font=self._font(18),
+            fill="#66605A",
+            anchor="mm",
+        )
+        first, second = session.players.get(FIRST), session.players.get(SECOND)
+        self._draw_avatar(image, first, avatars.get(FIRST), (190, 205), 126, "#B43B32")
+        self._draw_avatar(image, second, avatars.get(SECOND), (570, 205), 126, "#334C73")
+        draw.text((380, 205), "VS", font=self._font(42), fill="#A5834E", anchor="mm")
+
+        for x, side, player, align in (
+            (190, FIRST, first, "mm"),
+            (570, SECOND, second, "mm"),
+        ):
+            record = self._game_record(stats, player, session.game_id)
+            wins = int(record.get("wins", 0))
+            draws = int(record.get("draws", 0))
+            losses = int(record.get("losses", 0))
+            draw.text((x, 292), player.name if player else "—", font=self._font(26), fill=self.INK, anchor=align)
+            draw.text(
+                (x, 330),
+                f"{session.engine.side_names[0 if side == FIRST else 1]} · 等级分 {record.get('rating', 1000)}",
+                font=self._font(17),
+                fill="#5C5650",
+                anchor=align,
+            )
+            draw.text(
+                (x, 364),
+                f"本棋种 {wins}胜 {draws}和 {losses}负 · 胜率 {self._rate(wins, draws, losses)}",
+                font=self._font(15),
+                fill="#6B655F",
+                anchor=align,
+            )
+            all_w, all_d, all_l = self._totals(stats, player)
+            draw.text(
+                (x, 395),
+                f"总战绩 {all_w}胜 {all_d}和 {all_l}负 · 胜率 {self._rate(all_w, all_d, all_l)}",
+                font=self._font(15),
+                fill="#6B655F",
+                anchor=align,
+            )
+
+        game_h2h = self._h2h(stats, first, second, session.game_id)
+        all_h2h = self._h2h(stats, first, second)
+        draw.rounded_rectangle((85, 445, 675, 575), radius=18, fill="#F6F0E5")
+        draw.text((380, 475), "历史交手（左方视角）", font=self._font(19), fill="#5B4934", anchor="mm")
+        draw.text(
+            (380, 514),
+            f"本棋种：{game_h2h[0]}胜 {game_h2h[1]}和 {game_h2h[2]}负　·　全部：{all_h2h[0]}胜 {all_h2h[1]}和 {all_h2h[2]}负",
+            font=self._font(17),
+            fill=self.INK,
+            anchor="mm",
+        )
+        draw.text((380, 598), "双方选手已就位，比赛开始", font=self._font(16), fill="#85796B", anchor="mm")
+        stream = io.BytesIO()
+        image.save(stream, format="PNG", optimize=True)
+        return stream.getvalue()
+
+    def render_result_card(
+        self,
+        session: GameSession,
+        winner: str | None,
+        records: dict[str, dict],
+        avatars: dict[str, bytes | None],
+        reason: str,
+    ) -> bytes:
+        image = Image.new("RGB", (self.WIDTH, 570), "#EEE9DF")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(
+            (24, 24, 736, 546), radius=28, fill="#FFFDF8", outline="#D8CDBA", width=3
+        )
+        result_title = "和棋" if winner is None else f"{session.players[winner].name} 获胜"
+        draw.text((380, 68), "对局结束", font=self._font(29), fill="#6A625A", anchor="mm")
+        draw.text((380, 112), result_title, font=self._font(35), fill="#9C3D32", anchor="mm")
+        first, second = session.players.get(FIRST), session.players.get(SECOND)
+        self._draw_avatar(image, first, avatars.get(FIRST), (190, 225), 118, "#B43B32")
+        self._draw_avatar(image, second, avatars.get(SECOND), (570, 225), 118, "#334C73")
+        score = "和" if winner is None else "1 : 0" if winner == FIRST else "0 : 1"
+        draw.text(
+            (380, 225),
+            score,
+            font=self._font(34),
+            fill=self.INK,
+            anchor="mm",
+        )
+        for x, side, player in ((190, FIRST, first), (570, SECOND, second)):
+            item = records.get(side, {})
+            before = int(item.get("rating_before", 1000))
+            after = int(item.get("rating_after", before))
+            delta = after - before
+            draw.text((x, 306), player.name if player else "—", font=self._font(24), fill=self.INK, anchor="mm")
+            draw.text(
+                (x, 345),
+                f"等级分 {before} → {after}（{delta:+d}）",
+                font=self._font(17),
+                fill="#2D7A45" if delta > 0 else "#A1423A" if delta < 0 else "#666666",
+                anchor="mm",
+            )
+        draw.rounded_rectangle((100, 400, 660, 494), radius=16, fill="#F4EEE3")
+        reason_text = reason if len(reason) <= 28 else f"{reason[:27]}…"
+        draw.text(
+            (380, 428),
+            reason_text,
+            font=self._font(20),
+            fill="#5C5248",
+            anchor="mm",
+        )
+        draw.text(
+            (380, 465),
+            f"{session.engine.display_name} · 共 {len(session.engine.notation_history())} 手",
+            font=self._font(16),
+            fill="#7A7168",
+            anchor="mm",
+        )
+        draw.text((380, 522), "战绩与等级分已记录", font=self._font(15), fill="#8B8177", anchor="mm")
         stream = io.BytesIO()
         image.save(stream, format="PNG", optimize=True)
         return stream.getvalue()

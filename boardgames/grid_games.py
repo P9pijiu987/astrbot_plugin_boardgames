@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     FIRST,
@@ -22,12 +22,15 @@ class GomokuEngine(GameEngine):
     display_name = "五子棋"
     side_names = ("黑方", "白方")
 
-    RULE_LABELS = {
+    RULE_LABELS: ClassVar[dict[str, str]] = {
         "freestyle": "自由规则（五子或以上）",
         "standard": "标准规则（恰好五子）",
         "renju": "连珠规则（黑方禁手）",
     }
-    OPENING_LABELS = {"normal": "普通开局", "swap2": "Swap2 平衡开局"}
+    OPENING_LABELS: ClassVar[dict[str, str]] = {
+        "normal": "普通开局",
+        "swap2": "Swap2 平衡开局",
+    }
 
     def __init__(
         self,

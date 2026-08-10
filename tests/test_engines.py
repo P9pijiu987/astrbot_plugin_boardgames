@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
-
 import sys
 import unittest
 from pathlib import Path
@@ -226,6 +224,45 @@ class RenderingTests(unittest.TestCase):
                 if isinstance(engine, GoEngine):
                     influence = renderer.render_go_influence(session)
                     self.assertTrue(influence.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_match_and_result_cards_render_as_png(self):
+        renderer = BoardRenderer(PLUGIN_ROOT / "assets")
+        session = GameSession(
+            "test",
+            "chess",
+            ChessEngine(),
+            {
+                FIRST: Player("1", "甲"),
+                SECOND: Player("2", "乙"),
+            },
+            status="playing",
+        )
+        stats = {
+            "1": {
+                "chess": {
+                    "wins": 3,
+                    "draws": 1,
+                    "losses": 2,
+                    "rating": 1032,
+                    "history": [],
+                }
+            }
+        }
+        match = renderer.render_match_card(
+            session, stats, {FIRST: b"invalid", SECOND: None}
+        )
+        result = renderer.render_result_card(
+            session,
+            FIRST,
+            {
+                FIRST: {"rating_before": 1032, "rating_after": 1048},
+                SECOND: {"rating_before": 1000, "rating_after": 984},
+            },
+            {FIRST: None, SECOND: None},
+            "将死",
+        )
+        self.assertTrue(match.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(result.startswith(b"\x89PNG\r\n\x1a\n"))
 
 
 if __name__ == "__main__":

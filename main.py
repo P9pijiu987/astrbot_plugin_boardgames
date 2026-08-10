@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -36,10 +38,9 @@ from .boardgames.registry import (
 from .boardgames.render import BoardRenderer
 from .boardgames.session import GameSession, Player, SessionStore
 
-
 DEFAULT_TIME_CONTROLS = {
     "chess": "15+10",
-    "go": "20|3x30",
+    "go": "60|3x30",
     "xiangqi": "10+5",
     "gomoku": "20+3",
     "tictactoe": "2+2",
@@ -58,6 +59,7 @@ class BoardGamesPlugin(Star):
         self.renderer = BoardRenderer(Path(__file__).parent / "assets")
         self.timeout_tasks: dict[str, asyncio.Task] = {}
         self.clock_tasks: dict[str, asyncio.Task] = {}
+        self.avatar_cache: dict[str, bytes | None] = {}
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
@@ -97,11 +99,98 @@ class BoardGamesPlugin(Star):
         return str(event.unified_msg_origin)
 
     @staticmethod
-    def _player(event: AstrMessageEvent) -> Player:
+    def _avatar_url(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        for source in (sender, getattr(message_obj, "raw_message", None)):
+            if source is None:
+                continue
+            if isinstance(source, dict):
+                nested = source.get("sender")
+                candidates = [source, nested] if isinstance(nested, dict) else [source]
+                for item in candidates:
+                    for key in ("avatar_url", "avatar", "icon", "head_url"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value.startswith(("http://", "https://")):
+                            return value
+            else:
+                for key in ("avatar_url", "avatar", "icon", "head_url"):
+                    value = getattr(source, key, None)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        return value
+        user_id = str(event.get_sender_id())
+        origin = str(getattr(event, "unified_msg_origin", "")).lower()
+        raw = getattr(message_obj, "raw_message", None)
+        looks_like_qq = "qq" in origin or "aiocqhttp" in origin or (
+            isinstance(raw, dict) and "post_type" in raw
+        )
+        if looks_like_qq and user_id.isdigit():
+            return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=160"
+        return ""
+
+    @classmethod
+    def _player(cls, event: AstrMessageEvent) -> Player:
         return Player(
             str(event.get_sender_id()),
             str(event.get_sender_name() or event.get_sender_id()),
+            cls._avatar_url(event),
         )
+
+    @staticmethod
+    def _download_avatar(url: str) -> bytes | None:
+        if not url:
+            return None
+        hostname = (urlparse(url).hostname or "").lower()
+        allowed_hosts = (
+            "qlogo.cn",
+            "qpic.cn",
+            "qq.com",
+            "discord.com",
+            "discordapp.com",
+            "telegram.org",
+            "t.me",
+            "gravatar.com",
+            "slack-edge.com",
+            "larksuitecdn.com",
+            "byteimg.com",
+            "alicdn.com",
+            "kookapp.cn",
+        )
+        if not any(hostname == host or hostname.endswith(f".{host}") for host in allowed_hosts):
+            return None
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.4"},
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                data = response.read(2 * 1024 * 1024 + 1)
+            return data if len(data) <= 2 * 1024 * 1024 else None
+        except Exception:  # noqa: BLE001 - avatar failure must fall back to initials
+            return None
+
+    async def _avatars_for(self, session: GameSession) -> dict[str, bytes | None]:
+        result: dict[str, bytes | None] = {}
+        missing: list[tuple[str, str]] = []
+        for side in (FIRST, SECOND):
+            player = session.players.get(side)
+            if not player:
+                continue
+            url = player.avatar_url
+            if not url:
+                result[side] = None
+            elif url in self.avatar_cache:
+                result[side] = self.avatar_cache[url]
+            else:
+                missing.append((side, url))
+        if missing:
+            downloaded = await asyncio.gather(
+                *(asyncio.to_thread(self._download_avatar, url) for _, url in missing)
+            )
+            for (side, url), data in zip(missing, downloaded, strict=True):
+                self.avatar_cache[url] = data
+                result[side] = data
+        return result
 
     @staticmethod
     def _is_group(event: AstrMessageEvent) -> bool:
@@ -117,6 +206,29 @@ class BoardGamesPlugin(Star):
 
     async def _render(self, session: GameSession) -> bytes:
         return await asyncio.to_thread(self.renderer.render, session)
+
+    async def _render_match_card(self, session: GameSession) -> bytes:
+        avatars = await self._avatars_for(session)
+        return await asyncio.to_thread(
+            self.renderer.render_match_card, session, self.stats, avatars
+        )
+
+    async def _render_result_card(
+        self,
+        session: GameSession,
+        winner: str | None,
+        records: dict[str, dict[str, Any]],
+        reason: str,
+    ) -> bytes:
+        avatars = await self._avatars_for(session)
+        return await asyncio.to_thread(
+            self.renderer.render_result_card,
+            session,
+            winner,
+            records,
+            avatars,
+            reason,
+        )
 
     @staticmethod
     def _image_result(event: AstrMessageEvent, data: bytes):
@@ -140,14 +252,15 @@ class BoardGamesPlugin(Star):
     def _reminder_schedule(self) -> list[tuple[int, int]]:
         raw = str(
             self.config.get(
-                "clock_reminder_schedule", "300:60,120:30,60:10,30:5"
+                "clock_reminder_schedule",
+                "86400:60,180:30,120:15,60:10,30:5",
             )
         )
         try:
             return parse_reminder_schedule(raw)
         except ValueError:
             logger.warning(f"无效的棋钟提醒规则 {raw!r}，已使用默认值。")
-            return parse_reminder_schedule("300:60,120:30,60:10,30:5")
+            return parse_reminder_schedule("86400:60,180:30,120:15,60:10,30:5")
 
     def _schedule_clock(self, session: GameSession) -> None:
         old = self.clock_tasks.pop(session.key, None)
@@ -169,6 +282,29 @@ class BoardGamesPlugin(Star):
 
         await self.context.send_message(key, MessageChain().message(text))
 
+    async def _send_background_image(self, key: str, data: bytes) -> None:
+        from astrbot.api.event import MessageChain
+
+        await self.context.send_message(
+            key,
+            MessageChain(chain=[Comp.Image.fromBytes(data)]),
+        )
+
+    @staticmethod
+    def _clock_start_text(session: GameSession) -> str:
+        label = session.clock.get("label") if session.clock else "不计时"
+        if session.clock and session.clock.get("mode") == "byoyomi":
+            explanation = f"本局读秒用时：{label}（基本用时 | 读秒次数×每次秒数）。"
+        elif session.clock and session.clock.get("increment_seconds", 0):
+            explanation = f"本局用时：{label}（每方基础分钟 + 每步加秒）。"
+        else:
+            explanation = f"本局用时：{label}。"
+        return (
+            f"{explanation}\n"
+            "本局开始后不能修改棋钟；下次开局可追加 计时=15+10、"
+            "计时=60|3x30 或 不计时。使用 /计时规则 查看完整说明。"
+        )
+
     async def _clock_watch(self, key: str) -> None:
         schedule = self._reminder_schedule()
         previous = None
@@ -178,6 +314,7 @@ class BoardGamesPlugin(Star):
                 await asyncio.sleep(1)
                 reminder = None
                 timeout_text = None
+                timeout_image = None
                 async with self.store.lock(key):
                     session = self.store.get(key)
                     if (
@@ -192,7 +329,15 @@ class BoardGamesPlugin(Star):
                         winner_side = opponent(loser)
                         winner = session.players.get(winner_side)
                         loser_player = session.players.get(loser)
-                        self._record_result(session, winner_side, "timeout")
+                        records = self._record_result(
+                            session, winner_side, "timeout"
+                        )
+                        timeout_image = await self._render_result_card(
+                            session,
+                            winner_side,
+                            records,
+                            f"{loser_player.name if loser_player else '败方'}比赛用时耗尽",
+                        )
                         self.store.remove(key)
                         await self._persist()
                         timeout_text = (
@@ -221,6 +366,8 @@ class BoardGamesPlugin(Star):
                                 f"剩余 {format_clock(session.clock, active).replace('▶ ', '')}"
                             )
                 if timeout_text:
+                    if timeout_image:
+                        await self._send_background_image(key, timeout_image)
                     await self._send_background_text(key, timeout_text)
                     return
                 if reminder:
@@ -345,13 +492,13 @@ class BoardGamesPlugin(Star):
                     continue
                 side = self._parse_side(option, side_names)
                 if side:
-                    return "颜色不再在开局时指定；第二位玩家加入后，双方必须分别使用 /选先 或 /选后 完成选色。", None
+                    return "颜色不再在开局时指定；第二位玩家加入后，任一选手使用 /选先 或 /选后，另一人会自动分到相反阵营。", None
                 match = re.fullmatch(r"(\d{1,2})路?", option)
                 if match:
                     size = int(match.group(1))
                     continue
                 return (
-                    f"无法识别开局参数“{option}”。可使用棋盘路数、计时=15+10、计时=20|3x30 或 不计时；五子棋还可选自由/标准/连珠及 Swap2。",
+                    f"无法识别开局参数“{option}”。可使用棋盘路数、计时=15+10、计时=60|3x30 或 不计时；五子棋还可选自由/标准/连珠及 Swap2。",
                     None,
                 )
             try:
@@ -396,7 +543,7 @@ class BoardGamesPlugin(Star):
         """开一局棋。例如：/开局 国际象棋 计时=15+10、/开局 围棋 13路。"""
         if not game_type:
             yield event.plain_result(
-                "用法：/开局 [棋种] [路数] [计时=15+10 / 计时=20|3x30 / 不计时]\n"
+                "用法：/开局 [棋种] [路数] [计时=15+10 / 计时=60|3x30 / 不计时]\n"
                 "五子棋示例：/开局 五子棋 连珠 Swap2 计时=20+3"
             )
             return
@@ -448,57 +595,51 @@ class BoardGamesPlugin(Star):
                 self._cancel_timeout(key)
                 self._schedule_clock(session)
             await self._persist()
-            image = await self._render(session)
-        yield self._image_result(event, image)
+            board_image = await self._render(session)
+            match_card = await self._render_match_card(session) if is_swap2 else None
+            start_text = self._clock_start_text(session) if is_swap2 else ""
+        if match_card:
+            yield self._image_result(event, match_card)
+        yield self._image_result(event, board_image)
+        if start_text:
+            yield event.plain_result(start_text)
 
     async def _choose_regular_side_impl(
         self, event: AstrMessageEvent, desired_side: str
-    ) -> tuple[str | None, bytes | None]:
+    ) -> tuple[str | None, bytes | None, bytes | None, str]:
         key = self._key(event)
         async with self.store.lock(key):
             session = self.store.get(key)
             if not session or session.status != "choosing":
-                return "当前没有等待双方选色的棋局。", None
+                return "当前没有等待选色的棋局。", None, None, ""
             provisional_side = session.side_for(str(event.get_sender_id()))
             if not provisional_side:
-                return "只有本局两位参与者可以选色。", None
+                return "只有本局两位参与者可以选色。", None, None, ""
             other = session.other_player(provisional_side)
             if not other:
-                return "请等待第二位玩家加入后再选色。", None
-            other_choice = session.side_choices.get(other.user_id)
-            if other_choice == desired_side:
-                name = session.engine.side_names[0 if desired_side == FIRST else 1]
-                return f"对手已经选择{name}，请改选另一方。", None
+                return "请等待第二位玩家加入后再选色。", None, None, ""
             user_id = str(event.get_sender_id())
             session.side_choices[user_id] = desired_side
-            if len(session.side_choices) == 2:
-                participants = [
-                    player for player in session.players.values() if player is not None
-                ]
-                by_id = {player.user_id: player for player in participants}
-                session.players = {
-                    FIRST: by_id[
-                        next(
-                            uid
-                            for uid, side in session.side_choices.items()
-                            if side == FIRST
-                        )
-                    ],
-                    SECOND: by_id[
-                        next(
-                            uid
-                            for uid, side in session.side_choices.items()
-                            if side == SECOND
-                        )
-                    ],
-                }
-                session.status = "playing"
-                session.last_action_at = time.time()
-                start_clock(session.clock)
-                self._cancel_timeout(key)
-                self._schedule_clock(session)
+            session.side_choices[other.user_id] = opponent(desired_side)
+            chooser = session.players[provisional_side]
+            session.players = {
+                desired_side: chooser,
+                opponent(desired_side): other,
+            }
+            session.status = "playing"
+            session.last_action_at = time.time()
+            start_clock(session.clock)
+            self._cancel_timeout(key)
+            self._schedule_clock(session)
             await self._persist()
-            return None, await self._render(session)
+            match_card = await self._render_match_card(session)
+            board_image = await self._render(session)
+            return (
+                None,
+                match_card,
+                board_image,
+                self._clock_start_text(session),
+            )
 
     def _side_for_color(self, session: GameSession, color: str) -> str | None:
         for side, name in zip((FIRST, SECOND), session.engine.side_names, strict=True):
@@ -518,11 +659,15 @@ class BoardGamesPlugin(Star):
                     f"本棋种没有“{color}方”；请使用 /选先 或 /选后。"
                 )
                 return
-            error, image = await self._choose_regular_side_impl(event, desired)
+            error, match_card, board_image, start_text = (
+                await self._choose_regular_side_impl(event, desired)
+            )
             if error:
                 yield event.plain_result(error)
             else:
-                yield self._image_result(event, image)
+                yield self._image_result(event, match_card)
+                yield self._image_result(event, board_image)
+                yield event.plain_result(start_text)
             return
         if (
             color in {"白", "黑"}
@@ -538,7 +683,7 @@ class BoardGamesPlugin(Star):
 
     async def _swap2_choice_impl(
         self, event: AstrMessageEvent, choice: str
-    ) -> tuple[str | None, bytes | None]:
+    ) -> tuple[str | None, bytes | None, bytes | None]:
         key = self._key(event)
         async with self.store.lock(key):
             session = self.store.get(key)
@@ -548,24 +693,31 @@ class BoardGamesPlugin(Star):
                 or not isinstance(session.engine, GomokuEngine)
                 or session.engine.opening != "swap2"
             ):
-                return "当前没有进行 Swap2 开局的五子棋对局。", None
+                return "当前没有进行 Swap2 开局的五子棋对局。", None, None
             side = session.side_for(str(event.get_sender_id()))
             if not side:
-                return "只有本局选手可以进行 Swap2 选色。", None
+                return "只有本局选手可以进行 Swap2 选色。", None, None
             if side != session.engine.turn:
-                return session.engine.opening_prompt or "现在不需要你进行选择。", None
+                return (
+                    session.engine.opening_prompt or "现在不需要你进行选择。",
+                    None,
+                    None,
+                )
             loser = timed_out_side(session.clock)
             if loser:
                 winner_side = opponent(loser)
-                self._record_result(session, winner_side, "timeout")
+                records = self._record_result(session, winner_side, "timeout")
+                result_card = await self._render_result_card(
+                    session, winner_side, records, "Swap2 选色前比赛用时耗尽"
+                )
                 self.store.remove(key)
                 self._cancel_clock(key)
                 await self._persist()
-                return "你的比赛用时已经耗尽，对手获胜。", None
+                return "你的比赛用时已经耗尽，对手获胜。", None, result_card
             moment = time.time()
             outcome = session.engine.choose_opening(choice)
             if not outcome.ok:
-                return outcome.message, None
+                return outcome.message, None, None
             clock_loser = settle_and_switch(
                 session.clock,
                 session.engine.turn,
@@ -574,11 +726,14 @@ class BoardGamesPlugin(Star):
             )
             if clock_loser:
                 winner_side = opponent(clock_loser)
-                self._record_result(session, winner_side, "timeout")
+                records = self._record_result(session, winner_side, "timeout")
+                result_card = await self._render_result_card(
+                    session, winner_side, records, "Swap2 选色时比赛用时耗尽"
+                )
                 self.store.remove(key)
                 self._cancel_clock(key)
                 await self._persist()
-                return "你的比赛用时已经耗尽，对手获胜。", None
+                return "你的比赛用时已经耗尽，对手获胜。", None, result_card
             if outcome.extra.get("swap_players"):
                 session.players[FIRST], session.players[SECOND] = (
                     session.players[SECOND],
@@ -591,11 +746,13 @@ class BoardGamesPlugin(Star):
             session.pending = None
             session.last_action_at = moment
             await self._persist()
-            return None, await self._render(session)
+            return None, await self._render(session), None
 
     async def _yield_swap2_choice(self, event: AstrMessageEvent, choice: str):
-        error, image = await self._swap2_choice_impl(event, choice)
+        error, image, result_card = await self._swap2_choice_impl(event, choice)
         if error:
+            if result_card:
+                yield self._image_result(event, result_card)
             yield event.plain_result(error)
         else:
             yield self._image_result(event, image)
@@ -617,19 +774,27 @@ class BoardGamesPlugin(Star):
 
     @filter.command("选先")
     async def choose_first(self, event: AstrMessageEvent):
-        error, image = await self._choose_regular_side_impl(event, FIRST)
+        error, match_card, board_image, start_text = (
+            await self._choose_regular_side_impl(event, FIRST)
+        )
         if error:
             yield event.plain_result(error)
         else:
-            yield self._image_result(event, image)
+            yield self._image_result(event, match_card)
+            yield self._image_result(event, board_image)
+            yield event.plain_result(start_text)
 
     @filter.command("选后")
     async def choose_second(self, event: AstrMessageEvent):
-        error, image = await self._choose_regular_side_impl(event, SECOND)
+        error, match_card, board_image, start_text = (
+            await self._choose_regular_side_impl(event, SECOND)
+        )
         if error:
             yield event.plain_result(error)
         else:
-            yield self._image_result(event, image)
+            yield self._image_result(event, match_card)
+            yield self._image_result(event, board_image)
+            yield event.plain_result(start_text)
 
     @filter.command("交换")
     async def swap2_swap(self, event: AstrMessageEvent):
@@ -672,7 +837,10 @@ class BoardGamesPlugin(Star):
                 return
             if session.status != "playing":
                 if session.status == "choosing":
-                    yield event.plain_result("双方尚未完成选色，请分别使用 /选先 或 /选后。")
+                    yield event.plain_result(
+                        "尚未选色；任一选手使用 /选先 或 /选后，"
+                        "对手会自动分配另一方。"
+                    )
                 else:
                     yield event.plain_result("还在等待另一位玩家加入。")
                 return
@@ -685,10 +853,17 @@ class BoardGamesPlugin(Star):
             loser = timed_out_side(session.clock)
             if loser:
                 winner_side = opponent(loser)
-                self._record_result(session, winner_side, "timeout")
+                records = self._record_result(session, winner_side, "timeout")
+                result_card = await self._render_result_card(
+                    session,
+                    winner_side,
+                    records,
+                    "行棋前比赛用时已经耗尽",
+                )
                 self.store.remove(key)
                 self._cancel_clock(key)
                 await self._persist()
+                yield self._image_result(event, result_card)
                 yield event.plain_result("你的比赛用时已经耗尽，对手获胜。")
                 return
             moment = time.time()
@@ -699,31 +874,51 @@ class BoardGamesPlugin(Star):
             clock_loser = settle_and_switch(session.clock, session.engine.turn, moment)
             if clock_loser:
                 winner_side = opponent(clock_loser)
-                self._record_result(session, winner_side, "timeout")
+                records = self._record_result(session, winner_side, "timeout")
+                result_card = await self._render_result_card(
+                    session,
+                    winner_side,
+                    records,
+                    "行棋完成前比赛用时耗尽",
+                )
                 self.store.remove(key)
                 self._cancel_clock(key)
                 await self._persist()
+                yield self._image_result(event, result_card)
                 yield event.plain_result("行棋完成前比赛用时耗尽，对手获胜。")
                 return
             session.last_action_at = moment
             session.pending = None
             image = await self._render(session)
             end_text = ""
+            result_card = None
             if outcome.ended:
                 if outcome.draw:
                     end_text = outcome.message or "和棋。"
-                    self._record_result(session, None, "rules")
+                    records = self._record_result(session, None, "rules")
+                    result_card = await self._render_result_card(
+                        session, None, records, end_text
+                    )
                 else:
                     winner = session.players[outcome.winner]
                     end_text = (
                         f"{outcome.message} {winner.name if winner else '胜方'}获胜。"
                     )
-                    self._record_result(session, outcome.winner, "rules")
+                    records = self._record_result(
+                        session, outcome.winner, "rules"
+                    )
+                    result_card = await self._render_result_card(
+                        session,
+                        outcome.winner,
+                        records,
+                        outcome.message or "规则终局",
+                    )
                 self._cancel_clock(key)
                 self.store.remove(key)
             await self._persist()
         yield self._image_result(event, image)
         if end_text:
+            yield self._image_result(event, result_card)
             yield event.plain_result(end_text)
 
     @filter.command("下棋")
@@ -739,7 +934,7 @@ class BoardGamesPlugin(Star):
 
     def _record_result(
         self, session: GameSession, winner: str | None, reason: str = "completed"
-    ) -> None:
+    ) -> dict[str, dict[str, Any]]:
         now = int(time.time())
         max_history = max(1, int(self.config.get("max_history_per_user", 50)))
         records: dict[str, dict[str, Any]] = {}
@@ -766,6 +961,7 @@ class BoardGamesPlugin(Star):
             game.setdefault("losses", 0)
             game.setdefault("history", [])
             game["player_name"] = player.name
+            game["avatar_url"] = player.avatar_url
             records[side] = game
 
         ratings_before = {
@@ -792,8 +988,7 @@ class BoardGamesPlugin(Star):
             result = "draw" if winner is None else "win" if winner == side else "loss"
             counter = {"win": "wins", "draw": "draws", "loss": "losses"}[result]
             game[counter] += 1
-            game["history"].append(
-                {
+            item = {
                     "time": now,
                     "result": result,
                     "side": side,
@@ -810,8 +1005,13 @@ class BoardGamesPlugin(Star):
                         else "不计时"
                     ),
                 }
-            )
+            game["history"].append(item)
             game["history"] = game["history"][-max_history:]
+        return {
+            side: dict(records[side]["history"][-1])
+            for side in (FIRST, SECOND)
+            if side in records and records[side].get("history")
+        }
 
     def _require_player(
         self, event: AstrMessageEvent
@@ -881,10 +1081,17 @@ class BoardGamesPlugin(Star):
         )
         if clock_loser:
             winner_side = opponent(clock_loser)
-            self._record_result(session, winner_side, "timeout")
+            records = self._record_result(session, winner_side, "timeout")
+            result_card = await self._render_result_card(
+                session,
+                winner_side,
+                records,
+                "处理悔棋请求时比赛用时耗尽",
+            )
             self._cancel_clock(session.key)
             self.store.remove(session.key)
             await self._persist()
+            yield self._image_result(event, result_card)
             yield event.plain_result("处理悔棋请求时比赛用时耗尽，对手获胜。")
             return
         session.pending = None
@@ -936,10 +1143,14 @@ class BoardGamesPlugin(Star):
         ):
             yield event.plain_result("没有可同意的和棋提议。")
             return
-        self._record_result(session, None, "agreement")
+        records = self._record_result(session, None, "agreement")
+        result_card = await self._render_result_card(
+            session, None, records, "双方同意和棋"
+        )
         self._cancel_clock(session.key)
         self.store.remove(session.key)
         await self._persist()
+        yield self._image_result(event, result_card)
         yield event.plain_result("双方同意和棋，棋局结束。")
 
     @filter.command("拒绝和棋")
@@ -967,7 +1178,14 @@ class BoardGamesPlugin(Star):
             yield event.plain_result("当前没有棋局。")
             return
         side = session.side_for(str(event.get_sender_id()))
-        if session.status in {"waiting", "choosing"} and side:
+        if session.status == "waiting":
+            self.store.remove(key)
+            self._cancel_timeout(key)
+            self._cancel_clock(key)
+            await self._persist()
+            yield event.plain_result("等待加入的空房已取消。")
+            return
+        if session.status == "choosing" and side:
             self.store.remove(key)
             self._cancel_timeout(key)
             self._cancel_clock(key)
@@ -1041,10 +1259,17 @@ class BoardGamesPlugin(Star):
             return
         winner_side = opponent(side)
         winner = session.players[winner_side]
-        self._record_result(session, winner_side, "resign")
+        records = self._record_result(session, winner_side, "resign")
+        result_card = await self._render_result_card(
+            session,
+            winner_side,
+            records,
+            f"{event.get_sender_name()} 认输",
+        )
         self._cancel_clock(session.key)
         self.store.remove(session.key)
         await self._persist()
+        yield self._image_result(event, result_card)
         yield event.plain_result(
             f"{event.get_sender_name()} 认输，{winner.name if winner else '对手'}获胜。"
         )
@@ -1069,11 +1294,15 @@ class BoardGamesPlugin(Star):
                 )
                 return
             winner_side = opponent(loser)
-            self._record_result(session, winner_side, "timeout")
+            records = self._record_result(session, winner_side, "timeout")
+            result_card = await self._render_result_card(
+                session, winner_side, records, "比赛用时耗尽"
+            )
             self._cancel_clock(session.key)
             self.store.remove(session.key)
             await self._persist()
             winner = session.players.get(winner_side)
+            yield self._image_result(event, result_card)
             yield event.plain_result(
                 f"对手比赛用时耗尽，{winner.name if winner else '你'}获胜。"
             )
@@ -1085,10 +1314,17 @@ class BoardGamesPlugin(Star):
                 f"对手尚未超时，还需等待约 {int(remaining // 60) + 1} 分钟。"
             )
             return
-        self._record_result(session, side, "turn_timeout")
+        records = self._record_result(session, side, "turn_timeout")
+        result_card = await self._render_result_card(
+            session,
+            side,
+            records,
+            f"对手超过 {minutes} 分钟未行棋",
+        )
         self._cancel_clock(session.key)
         self.store.remove(session.key)
         await self._persist()
+        yield self._image_result(event, result_card)
         yield event.plain_result(
             f"对手超过 {minutes} 分钟未行棋，判 {event.get_sender_name()} 获胜。"
         )
@@ -1217,13 +1453,13 @@ class BoardGamesPlugin(Star):
             "棋钟在双方完成选边后启动，用尽自动判负，并显示在每张棋盘图顶部。\n"
             "开局可覆盖默认值：\n"
             "/开局 国际象棋 计时=15+10（每方15分钟，每步加10秒）\n"
-            "/开局 围棋 计时=20|3x30（20分钟，随后3次30秒读秒）\n"
+            "/开局 围棋 计时=60|3x30（60分钟，随后3次30秒读秒）\n"
             "/开局 黑白棋 计时=10（每方包干10分钟）\n"
             "/开局 五子棋 不计时\n"
-            "默认：国际象棋15+10、围棋20|3x30、中国象棋10+5、"
+            "默认：国际象棋15+10、围棋60|3x30、中国象棋10+5、"
             "五子棋20+3、井字棋2+2、黑白棋10。管理员可在插件配置中逐项修改。\n"
-            "默认提醒：5分钟内每1分钟、2分钟内每30秒、1分钟内每10秒、"
-            "30秒内每5秒；提醒档位也可在插件配置中直接编辑。"
+            "默认提醒：全程每分钟、3分钟内每30秒、2分钟内每15秒、"
+            "1分钟内每10秒、30秒内每5秒；提醒档位也可在插件配置中直接编辑。"
         )
 
     @filter.command("围棋计分", alias={"围棋和棋", "围棋数目"})
@@ -1283,20 +1519,41 @@ class BoardGamesPlugin(Star):
 
     @filter.command("对局记录", alias={"历史战绩", "战绩记录"})
     async def show_history(self, event: AstrMessageEvent, game_type: str = ""):
-        """查看自己的最近十局，可按棋种筛选。"""
+        """查看自己或被提及玩家的汇总战绩与最近十局。"""
         requested = normalize_game(game_type) if game_type else None
         if game_type and not requested:
-            yield event.plain_result("无法识别棋种。")
+            yield event.plain_result(
+                "无法识别棋种。用法：/对局记录、/对局记录 围棋、"
+                "/对局记录 @某人、/对局记录 @某人 围棋。"
+            )
             return
-        user = self.stats.get(str(event.get_sender_id()), {})
+        target_id, mention_name = self._history_target(event)
+        user = self.stats.get(target_id, {})
+        target_name = mention_name or str(event.get_sender_name())
+        for record in user.values():
+            if record.get("player_name"):
+                target_name = str(record["player_name"])
+                break
         rows: list[tuple[int, str, dict[str, Any]]] = []
+        summary: list[tuple[str, int, int, int, int]] = []
         for game_id, record in user.items():
             if requested and game_id != requested:
                 continue
+            wins = int(record.get("wins", 0))
+            draws = int(record.get("draws", 0))
+            losses = int(record.get("losses", 0))
+            summary.append(
+                (game_id, wins, draws, losses, int(record.get("rating", 1000)))
+            )
             for item in record.get("history", []):
                 rows.append((int(item.get("time", 0)), game_id, item))
-        if not rows:
-            yield event.plain_result("暂无符合条件的对局记录。")
+        if not summary:
+            scope = GAME_INFO[requested]["name"] if requested else "任何棋种"
+            yield event.plain_result(
+                f"{target_name} 暂无{scope}已完成对局。\n"
+                "用法：/对局记录、/对局记录 围棋、/对局记录 @某人、"
+                "/对局记录 @某人 围棋。"
+            )
             return
         result_labels = {"win": "胜", "draw": "和", "loss": "负"}
         reason_labels = {
@@ -1307,9 +1564,30 @@ class BoardGamesPlugin(Star):
             "turn_timeout": "单步超时",
             "completed": "正常结束",
         }
-        lines = [f"{event.get_sender_name()} 最近对局"]
+        total_wins = sum(item[1] for item in summary)
+        total_draws = sum(item[2] for item in summary)
+        total_losses = sum(item[3] for item in summary)
+        total = total_wins + total_draws + total_losses
+        scope = GAME_INFO[requested]["name"] if requested else "全部棋种"
+        win_rate = total_wins / total * 100 if total else 0.0
+        lines = [
+            f"{target_name} · {scope}对局记录",
+            f"总计 {total} 局：{total_wins}胜 {total_draws}和 {total_losses}负 · 胜率 {win_rate:.1f}%",
+        ]
+        for game_id, wins, draws, losses, rating in summary:
+            game_total = wins + draws + losses
+            rate = wins / game_total * 100 if game_total else 0.0
+            lines.append(
+                f"{GAME_INFO.get(game_id, {'name': game_id})['name']}："
+                f"{wins}胜 {draws}和 {losses}负 · 胜率 {rate:.1f}% · 等级分 {rating}"
+            )
+        lines.append("\n最近 10 局")
         for timestamp, game_id, item in sorted(rows, reverse=True)[:10]:
-            stamp = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+            stamp = (
+                datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                .astimezone()
+                .strftime("%m-%d %H:%M")
+            )
             name = GAME_INFO.get(game_id, {"name": game_id})["name"]
             duration = max(0, int(item.get("duration_seconds", 0)))
             duration_text = f"{duration // 60}分{duration % 60:02d}秒"
@@ -1326,6 +1604,25 @@ class BoardGamesPlugin(Star):
                 f"{rating_before}→{rating_after} · {item.get('time_control', '—')}"
             )
         yield event.plain_result("\n".join(lines))
+
+    @staticmethod
+    def _history_target(event: AstrMessageEvent) -> tuple[str, str]:
+        message_obj = getattr(event, "message_obj", None)
+        self_id = str(getattr(message_obj, "self_id", ""))
+        for component in getattr(message_obj, "message", []) or []:
+            if component.__class__.__name__ != "At" and not hasattr(component, "qq"):
+                continue
+            user_id = str(getattr(component, "qq", ""))
+            if not user_id or user_id in {"all", self_id}:
+                continue
+            name = str(getattr(component, "name", "") or user_id)
+            group = getattr(message_obj, "group", None)
+            for member in getattr(group, "members", []) or []:
+                if str(getattr(member, "user_id", "")) == user_id:
+                    name = str(getattr(member, "nickname", "") or name)
+                    break
+            return user_id, name
+        return str(event.get_sender_id()), str(event.get_sender_name())
 
     @filter.command("排行榜", alias={"等级分榜", "棋类排行"})
     async def show_ranking(self, event: AstrMessageEvent, game_type: str = ""):
@@ -1368,28 +1665,95 @@ class BoardGamesPlugin(Star):
             return
         yield event.plain_result("\n\n".join(sections))
 
-    @filter.command(
-        "棋类帮助", alias={"棋盘游戏帮助", "国际象棋帮助", "国际象棋下棋帮助"}
-    )
+    @filter.command("棋类帮助", alias={"棋盘游戏帮助"})
     async def help(self, event: AstrMessageEvent):
-        """显示插件指令和各棋种走法。"""
+        """显示插件总览和分棋种帮助入口。"""
         yield event.plain_result(
             "多棋盘插件\n"
             "开局：/开局 国际象棋 [计时=15+10]\n"
-            "      /开局 围棋 [9路/13路/19路，默认19路] [计时=20|3x30]\n"
+            "      /开局 围棋 [9路/13路/19路，默认19路] [计时=60|3x30]\n"
             "      /开局 中国象棋 | 井字棋 | 黑白棋\n"
             "      /开局 五子棋 [自由/标准/连珠] [Swap2] [13/15/19路]\n"
-            "加入：/加入棋局；随后双方必须分别 /选先、/选后（也可按棋种 /选黑、/选白、/选红）。\n"
-            "走子：可用 /下棋 Nc3、/Nc3、Nc3；坐标可连写或空格分隔。\n"
-            "国际象棋：Nc3 / b1c3\n"
-            "围棋：D4 / pass（坐标跳过 I）\n"
-            "中国象棋：炮二平五 / h2e2\n"
-            "五子棋、黑白棋：H8；井字棋：1～9 或 A1～C3\n"
+            "加入：/加入棋局；任一选手选边后，对手自动分到另一方。\n"
+            "选边：/选先 /选后，或对应棋种的 /选黑 /选白 /选红。\n"
+            "走子格式：/下棋帮助\n"
             "管理：/棋盘 /棋谱 /棋钟 /计时规则 /悔棋 /和棋 /流局 /认输\n"
-            "战绩：/战绩 /对局记录 [棋种] /排行榜 [棋种]\n"
+            "战绩：/战绩 /对局记录 [@玩家] [棋种] /排行榜 [棋种]\n"
             "Swap2：/选白 /选黑 /交换 /加两子（按棋盘提示使用）\n"
             "分析：/AI分析；围棋也可用 /势力范围（均需对手 /同意AI）\n"
-            "      所有棋种均返回双方胜率与推荐着法，围棋另发纯图片势力图。\n"
-            "围棋：/围棋计分 查看规则数子、AI估分及和棋的区别。\n"
-            "说明：下棋以外的指令必须保留 /；裸走法只对当前行棋者生效。"
+            "分棋种：/国际象棋帮助 /围棋帮助 /中国象棋帮助 /五子棋帮助 "
+            "/井字棋帮助 /黑白棋帮助"
+        )
+
+    @filter.command("下棋帮助", alias={"走子帮助", "国际象棋下棋帮助"})
+    async def move_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "下棋指令\n"
+            "轮到自己时可发送：/下棋 Nc3、/Nc3 或直接 Nc3。\n"
+            "坐标可连写或空格分隔，例如 /b1c3、/b1 c3、b1 c3。\n"
+            "国际象棋：Nc3、b1c3、O-O；围棋：D4、pass（跳过 I）；\n"
+            "中国象棋：炮二平五、h2e2；五子棋/黑白棋：H8；"
+            "井字棋：1～9 或 A1～C3。\n"
+            "裸走法仅在本群有棋局、发送者是当前方且文本能识别为合法格式时接管；"
+            "认输、悔棋、AI分析等非走子指令仍必须带 /。\n"
+            "需要规则细节时使用对应的 /xx棋帮助。"
+        )
+
+    @filter.command("国际象棋帮助")
+    async def chess_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "国际象棋帮助\n"
+            "开局：/开局 国际象棋（默认 15+10）→ /加入棋局 → 任一人 /选白 或 /选黑。\n"
+            "走法支持 SAN：Nc3、Nxf7+、O-O、e8=Q；也支持 UCI：b1c3、e2 e4。\n"
+            "完整处理王车易位、吃过路兵、升变、将军、将死、逼和与规则和棋。\n"
+            "可用 /棋谱、/悔棋、/和棋、/认输、/AI分析。"
+        )
+
+    @filter.command("围棋帮助")
+    async def go_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "围棋帮助\n"
+            "开局：/开局 围棋 [9路/13路/19路]，默认标准 19 路、60|3x30。\n"
+            "走子：D4；字母跳过 I。停一手：pass。任一人 /选黑 或 /选白。\n"
+            "支持提子、禁入点和全局同形。双方连续 pass 后按面积数子终局；"
+            "默认白贴 6.5 目，详见 /围棋计分。\n"
+            "/AI分析 或 /势力范围 经对手同意后给出估算胜率、推荐着点和势力图。"
+        )
+
+    @filter.command("中国象棋帮助", alias={"象棋帮助"})
+    async def xiangqi_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "中国象棋帮助\n"
+            "开局：/开局 中国象棋（默认 10+5），任一人 /选红 或 /选黑。\n"
+            "支持中文记谱：炮二平五、马八进七；支持坐标：h2e2、h2 e2。\n"
+            "包含蹩马腿、塞象眼、炮架、九宫、将帅照面、将军与送将校验。\n"
+            "同路同名棋子难以区分时建议使用坐标走法。"
+        )
+
+    @filter.command("五子棋帮助")
+    async def gomoku_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "五子棋帮助\n"
+            "开局：/开局 五子棋 [自由/标准/连珠] [Swap2] [13/15/19路]。\n"
+            "自由：五子及以上胜；标准：必须恰好五子；连珠：15路，黑有长连、四四、三三禁手。\n"
+            "走子：H8。普通开局任一人 /选黑 或 /选白。\n"
+            "Swap2 按棋盘提示使用 /选白、/交换、/加两子，最终再 /选黑 或 /选白。"
+        )
+
+    @filter.command("井字棋帮助")
+    async def tictactoe_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "井字棋帮助\n"
+            "开局：/开局 井字棋（默认 2+2），任一人 /选先 或 /选后。\n"
+            "走子可用数字 1～9（从左上到右下），或 A1～C3。\n"
+            "任意横、竖、斜线连成三子获胜；棋盘填满且无人连线则和棋。"
+        )
+
+    @filter.command("黑白棋帮助", alias={"奥赛罗帮助"})
+    async def reversi_help(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "黑白棋帮助\n"
+            "开局：/开局 黑白棋（默认每方 10 分钟包干），任一人 /选黑 或 /选白。\n"
+            "走子：D3、C4 等坐标；落子必须夹住并翻转至少一枚对方棋子。\n"
+            "无合法着法时自动跳过；双方都无合法着法或棋盘填满后，棋子更多者获胜。"
         )

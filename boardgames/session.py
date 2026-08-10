@@ -13,13 +13,22 @@ from .registry import restore_engine
 class Player:
     user_id: str
     name: str
+    avatar_url: str = ""
 
     def to_dict(self) -> dict[str, str]:
-        return {"user_id": self.user_id, "name": self.name}
+        return {
+            "user_id": self.user_id,
+            "name": self.name,
+            "avatar_url": self.avatar_url,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Player:
-        return cls(str(data["user_id"]), str(data.get("name", data["user_id"])))
+        return cls(
+            str(data["user_id"]),
+            str(data.get("name", data["user_id"])),
+            str(data.get("avatar_url", "")),
+        )
 
 
 @dataclass(slots=True)
