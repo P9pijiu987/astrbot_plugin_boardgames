@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -144,6 +145,113 @@ async def _collect(generator):
 
 
 class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_kv_state_is_migrated_to_plugin_data_file(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = SimpleNamespace(send_message=None)
+            plugin = module.BoardGamesPlugin(context, {})
+            plugin._data_root = root
+            plugin._state_file_store = module.JsonStateStore(
+                root / "plugin_data" / "astrbot_plugin_boardgames" / "state.json"
+            )
+            plugin._kv["stats"] = {
+                "1": {
+                    "go": {
+                        "wins": 2,
+                        "draws": 0,
+                        "losses": 1,
+                        "rating": 1010,
+                        "history": [],
+                    }
+                }
+            }
+            await plugin.on_loaded()
+            state = plugin._state_file_store.load()
+            self.assertEqual(state.stats["1"]["go"]["wins"], 2)
+            self.assertIn("kv:astrbot_plugin_boardgames", state.migrations)
+
+            restored = module.BoardGamesPlugin(context, {})
+            restored._data_root = root
+            restored._state_file_store = plugin._state_file_store
+            restored._kv = dict(plugin._kv)
+            await restored.on_loaded()
+            self.assertEqual(restored.stats["1"]["go"]["wins"], 2)
+            await restored.terminate()
+
+    async def test_renamed_chess_kv_is_migrated_once(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+
+        class PreferencesDB:
+            async def get_preferences(self, scope, _scope_id, key):
+                if scope != "plugin" or key != "stats":
+                    return []
+                return [
+                    SimpleNamespace(
+                        scope_id=(
+                            "soulter（原版）_ codex 重写/astrbot_plugin_chess"
+                        ),
+                        value={
+                            "val": {
+                                "9": {
+                                    "chess": {
+                                        "wins": 4,
+                                        "draws": 1,
+                                        "losses": 2,
+                                        "rating": 1030,
+                                        "history": [],
+                                    }
+                                }
+                            }
+                        },
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = PreferencesDB()
+            context = SimpleNamespace(
+                send_message=None,
+                get_db=lambda: database,
+            )
+            plugin = module.BoardGamesPlugin(context, {})
+            plugin.plugin_id = (
+                "soulter（原版）_ codex 重写/astrbot_plugin_boardgames"
+            )
+            plugin._data_root = root
+            plugin._state_file_store = module.JsonStateStore(
+                root / "plugin_data" / "astrbot_plugin_boardgames" / "state.json"
+            )
+            await plugin.on_loaded()
+            self.assertEqual(plugin.stats["9"]["chess"]["wins"], 4)
+            first = plugin._state_file_store.load()
+            self.assertIn(
+                "kv:soulter（原版）_ codex 重写/astrbot_plugin_chess",
+                first.migrations,
+            )
+
+            await plugin.on_loaded()
+            self.assertEqual(plugin.stats["9"]["chess"]["wins"], 4)
+            await plugin.terminate()
+
+    async def test_corrupt_state_is_not_overwritten_without_backup(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "plugin_data" / "astrbot_plugin_boardgames" / "state.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("{corrupt", encoding="utf-8")
+            plugin = module.BoardGamesPlugin(
+                SimpleNamespace(send_message=None),
+                {},
+            )
+            plugin._data_root = root
+            plugin._state_file_store = module.JsonStateStore(path)
+            await plugin.on_loaded()
+            self.assertTrue(plugin._storage_blocked)
+            await plugin.terminate()
+            self.assertEqual(path.read_text(encoding="utf-8"), "{corrupt")
+
     async def test_start_join_and_bare_move_emit_image_only(self):
         module = importlib.import_module("astrbot_plugin_boardgames.main")
         context = SimpleNamespace(send_message=lambda *_args, **_kwargs: None)

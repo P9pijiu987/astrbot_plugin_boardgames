@@ -15,9 +15,11 @@
 
 在 AstrBot WebUI 的插件管理中上传本插件 ZIP。新版要求 AstrBot `>=4.9.2,<5`，依赖会通过 `requirements.txt` 安装。
 
-若从旧版覆盖升级，建议先在旧棋局结束后再更新。旧版把战绩写在插件目录内，新版按官方规范使用插件 KV 存储，因此旧战绩不会自动导入。
+若从旧版覆盖升级，建议先在旧棋局结束后再更新。2.4.2 起，长期数据主文件位于 `data/plugin_data/astrbot_plugin_boardgames/state.json`，旁边保留上一版 `state.json.bak`；AstrBot 插件 KV 仅作为兼容镜像。
 
-从 2.4.1 起，`metadata.yaml` 已声明本 GitHub 仓库，安装后可直接使用 WebUI 的“更新”功能。若旧版本因缺少更新源而必须删除后重装，请在卸载时**取消勾选**“同时删除插件持久化数据”，再安装新版；插件名称和作者不变时，AstrBot 会继续使用原来的 KV 战绩。勾选该项会按设计永久清除战绩和未结束棋局，除非已有 AstrBot 数据库备份，否则插件无法恢复。
+首次启动 2.4.2 会自动尝试导入当前 `astrbot_plugin_boardgames` KV、改名前的 `astrbot_plugin_chess` KV，以及仍可找到的原版 `chess_stats.json`。每个来源只迁移一次，旧数据不会被删除。若旧版本因缺少更新源而必须删除后重装，请在卸载时**取消勾选**“同时删除插件持久化数据”；勾选该项会同时删除 `plugin_data` 和插件 KV。
+
+从 2.4.1 起，`metadata.yaml` 已声明本 GitHub 仓库；仓库中的修复合入默认分支后，可直接使用 WebUI 的“更新”功能。
 
 ## 快速上手
 
@@ -148,13 +150,14 @@ Swap2 流程：开局者连续摆黑、白、黑三子；后加入者使用 `/�
 - 围棋终局采用简化面积数子，不自动识别死子；正式对局应先自行提净死子。
 - 中国象棋中文记谱支持常见的“炮二平五”形式；同路同名棋子需要区分前后时，请使用无歧义坐标记谱。
 - 连珠禁手按 RIF 定义检测长连、四四、三三，并对常见“假三”进行递归合法性排除；极端复合题型仍建议以正式裁判结论为准。
-- 活跃棋局和战绩使用 AstrBot 插件 KV 存储。更新/重载不会把数据写回插件目录。
+- 活跃棋局和战绩保存在 `data/plugin_data/astrbot_plugin_boardgames/state.json`，写入时原子替换并保留一份 `.bak`；KV 仅作兼容镜像。更新插件目录不会触碰该文件。
 
 ## 目录
 
 ```text
 main.py                    AstrBot 事件与指令适配
 boardgames/session.py      房间、玩家和并发锁
+boardgames/storage.py      plugin_data 状态文件、备份与旧数据迁移
 boardgames/clock.py        加秒、包干、围棋读秒和分级提醒
 boardgames/*_engine.py     各棋种规则
 boardgames/render.py       统一图片渲染
@@ -162,4 +165,4 @@ _conf_schema.json          WebUI 配置
 tests/                     不依赖 AstrBot 的规则回归测试
 ```
 
-开发接口依据 [AstrBot 官方插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)；持久化使用官方插件 KV，图片通过单图片消息链发送。连珠禁手依据 [RIF 国际连珠规则](https://www.renju.net/rifrules/)，Swap2 流程依据 [RIF/RenjuNet 的 Gomoku Swap2 规则](https://www.renju.net/rule/11/)。棋钟预设参考 [FIDE 快棋规则](https://handbook.fide.com/chapter/e012023)、[世界业余围棋规则](https://www.nihonkiin.or.jp/event/amakisen/worldama/34/e/rules.html)、[中国象棋业余赛事规程](https://www.sport.gov.cn/qpzx/n5387/c29676858/content.html) 和 [RenjuNet 五子棋赛事用时](https://www.renju.net/tournament/3521/)。
+开发接口依据 [AstrBot 官方插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)；长期数据遵循官方规范存放于 `data/plugin_data/{plugin_name}/`，图片通过单图片消息链发送。连珠禁手依据 [RIF 国际连珠规则](https://www.renju.net/rifrules/)，Swap2 流程依据 [RIF/RenjuNet 的 Gomoku Swap2 规则](https://www.renju.net/rule/11/)。棋钟预设参考 [FIDE 快棋规则](https://handbook.fide.com/chapter/e012023)、[世界业余围棋规则](https://www.nihonkiin.or.jp/event/amakisen/worldama/34/e/rules.html)、[中国象棋业余赛事规程](https://www.sport.gov.cn/qpzx/n5387/c29676858/content.html) 和 [RenjuNet 五子棋赛事用时](https://www.renju.net/tournament/3521/)。
