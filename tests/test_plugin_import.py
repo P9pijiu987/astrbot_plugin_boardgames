@@ -99,6 +99,8 @@ class PluginImportTests(unittest.TestCase):
         self.assertTrue(callable(plugin.agree_analysis))
         for handler in (
             "move_help",
+            "detailed_help",
+            "rating_help",
             "chess_help",
             "go_help",
             "xiangqi_help",
@@ -537,10 +539,29 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin = module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
         event = _Event("1", "甲")
         move_help = await _collect(plugin.move_help(event))
+        short_help = await _collect(plugin.help(event))
+        detailed_help = await _collect(plugin.detailed_help(event))
+        rating_help = await _collect(plugin.rating_help(event))
         go_help = await _collect(plugin.go_help(event))
         self.assertIn("/下棋 Nc3", move_help[0][1])
+        self.assertIn("三步开局", short_help[0][1])
+        self.assertIn("完整指令索引", plugin.detailed_help.__doc__)
+        self.assertIn("/等级分说明", detailed_help[0][1])
+        self.assertIn("K=32", rating_help[0][1])
+        self.assertIn("胜1、和0.5、负0", rating_help[0][1])
         self.assertIn("默认标准 19 路、60|3x30", go_help[0][1])
         self.assertIn("面积数子", go_help[0][1])
+        for handler_name in (
+            "chess_help",
+            "go_help",
+            "xiangqi_help",
+            "gomoku_help",
+            "tictactoe_help",
+            "reversi_help",
+        ):
+            result = await _collect(getattr(plugin, handler_name)(event))
+            self.assertIn("【简介】", result[0][1])
+            self.assertIn("【详细】", result[0][1])
         await plugin.terminate()
 
 
