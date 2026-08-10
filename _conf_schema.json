@@ -1,0 +1,39 @@
+{
+  "enable_bare_moves": {
+    "type": "bool",
+    "description": "允许省略 / 和“下棋”，直接发送走法",
+    "hint": "只会在本群存在棋局、发送者是当前行棋者且文本符合该棋种走法格式时接管消息。",
+    "default": true
+  },
+  "enable_ai_analysis": {
+    "type": "bool",
+    "description": "允许双方同意后进行轻量局势分析",
+    "hint": "六个棋种均返回双方胜率和推荐着法；围棋追加势力范围图。使用本地启发式算法，不调用付费 LLM，也不会启动外部棋力引擎。",
+    "default": true
+  },
+  "waiting_timeout_minutes": {
+    "type": "int",
+    "description": "等待第二位玩家加入的超时分钟数",
+    "default": 10
+  },
+  "turn_timeout_minutes": {
+    "type": "int",
+    "description": "允许使用 /强制胜利 的单步超时分钟数",
+    "default": 10
+  },
+  "go_komi": {
+    "type": "float",
+    "description": "围棋白方贴目",
+    "default": 6.5
+  },
+  "persist_active_games": {
+    "type": "bool",
+    "description": "重载或重启后恢复未结束棋局",
+    "default": true
+  },
+  "max_history_per_user": {
+    "type": "int",
+    "description": "每位用户、每个棋种保留的最近战绩条数",
+    "default": 50
+  }
+}
