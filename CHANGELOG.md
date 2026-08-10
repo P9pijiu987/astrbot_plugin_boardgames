@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.4.2
+
+- 将战绩和未结束棋局的主存储迁移到 `data/plugin_data/astrbot_plugin_boardgames/state.json`，KV 改为兼容镜像。
+- 状态文件使用临时文件原子替换，并保留 `state.json.bak`；主文件损坏时自动回退，加载失败时禁止覆盖原数据。
+- 首次启动自动尝试迁移当前 `astrbot_plugin_boardgames` KV、旧 `astrbot_plugin_chess` KV，以及仍然存在的原版 `chess_stats.json`，且用迁移标记避免重复累加。
+
+## 2.4.1
+
+- 在 `metadata.yaml` 补充 GitHub `repo`，修复 WebUI 无法确定插件更新源的问题。
+- 补充卸载重装时保留 AstrBot 插件 KV 数据的说明；若要保留战绩，不要勾选“同时删除插件持久化数据”。
+
 ## 2.4.0
 
 - 等待加入的空房现在允许群内任何成员使用 `/流局` 清理。

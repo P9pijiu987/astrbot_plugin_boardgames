@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import re
 import time
 import urllib.request
@@ -37,6 +39,11 @@ from .boardgames.registry import (
 )
 from .boardgames.render import BoardRenderer
 from .boardgames.session import GameSession, Player, SessionStore
+from .boardgames.storage import (
+    JsonStateStore,
+    convert_legacy_chess_stats,
+    merge_stats,
+)
 
 DEFAULT_TIME_CONTROLS = {
     "chess": "15+10",
@@ -45,6 +52,11 @@ DEFAULT_TIME_CONTROLS = {
     "gomoku": "20+3",
     "tictactoe": "2+2",
     "reversi": "10",
+}
+PLUGIN_DATA_DIR_NAME = "astrbot_plugin_boardgames"
+MIGRATABLE_PLUGIN_NAMES = {
+    "astrbot_plugin_boardgames",
+    "astrbot_plugin_chess",
 }
 
 
@@ -60,29 +72,31 @@ class BoardGamesPlugin(Star):
         self.timeout_tasks: dict[str, asyncio.Task] = {}
         self.clock_tasks: dict[str, asyncio.Task] = {}
         self.avatar_cache: dict[str, bytes | None] = {}
+        self.persist_lock = asyncio.Lock()
+        self._state_file_store: JsonStateStore | None = None
+        self._data_root: Path | None = None
+        self._completed_migrations: list[str] = []
+        self._storage_blocked = False
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         """恢复未结束棋局和战绩。"""
         try:
-            self.stats = dict(await self.get_kv_data("stats", {}))
-            if self.config.get("persist_active_games", True):
-                errors = self.store.restore(
-                    dict(await self.get_kv_data("active_games", {}))
-                )
-                for error in errors:
-                    logger.warning(f"棋局恢复失败: {error}")
-                for session in self.store.sessions.values():
-                    if session.status in {"waiting", "choosing"}:
-                        self._schedule_wait_timeout(session)
-                    elif session.status == "playing":
-                        if session.clock is None and not session.clock_disabled:
-                            session.clock = self._create_game_clock(session.game_id, None)
-                            start_clock(session.clock)
-                        self._schedule_clock(session)
+            await self._load_persisted_state()
+            for session in self.store.sessions.values():
+                if session.status in {"waiting", "choosing"}:
+                    self._schedule_wait_timeout(session)
+                elif session.status == "playing":
+                    if session.clock is None and not session.clock_disabled:
+                        session.clock = self._create_game_clock(session.game_id, None)
+                        start_clock(session.clock)
+                    self._schedule_clock(session)
             logger.info(f"多棋盘插件已载入，恢复 {len(self.store.sessions)} 局。")
         except Exception as exc:  # noqa: BLE001 - plugin startup must remain recoverable
-            logger.exception(f"载入棋局数据失败，将从空状态启动: {exc}")
+            self._storage_blocked = True
+            logger.exception(
+                f"载入棋局数据失败，为防止覆盖原文件，本次运行将禁止持久化: {exc}"
+            )
 
     async def terminate(self):
         for task in self.timeout_tasks.values():
@@ -97,6 +111,148 @@ class BoardGamesPlugin(Star):
 
     def _key(self, event: AstrMessageEvent) -> str:
         return str(event.unified_msg_origin)
+
+    def _get_data_root(self) -> Path:
+        if self._data_root is None:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            self._data_root = Path(get_astrbot_data_path())
+        return self._data_root
+
+    def _get_state_file_store(self) -> JsonStateStore:
+        if self._state_file_store is None:
+            self._state_file_store = JsonStateStore(
+                self._get_data_root()
+                / "plugin_data"
+                / PLUGIN_DATA_DIR_NAME
+                / "state.json"
+            )
+        return self._state_file_store
+
+    @staticmethod
+    def _preference_value(preference: Any) -> dict[str, Any]:
+        wrapped = getattr(preference, "value", {})
+        value = wrapped.get("val", {}) if isinstance(wrapped, dict) else {}
+        return dict(value) if isinstance(value, dict) else {}
+
+    async def _legacy_kv_sources(
+        self, key: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        get_db = getattr(self.context, "get_db", None)
+        if not callable(get_db):
+            return []
+        database = get_db()
+        get_preferences = getattr(database, "get_preferences", None)
+        if not callable(get_preferences):
+            return []
+        try:
+            preferences = await get_preferences("plugin", None, key)
+        except Exception as exc:  # noqa: BLE001 - migration remains best effort
+            logger.warning(f"扫描旧插件 KV 失败（{key}）: {exc}")
+            return []
+        current_id = str(getattr(self, "plugin_id", ""))
+        sources = []
+        for preference in preferences:
+            scope_id = str(getattr(preference, "scope_id", ""))
+            plugin_name = scope_id.rsplit("/", 1)[-1]
+            if (
+                not scope_id
+                or scope_id == current_id
+                or plugin_name not in MIGRATABLE_PLUGIN_NAMES
+            ):
+                continue
+            value = self._preference_value(preference)
+            if value:
+                sources.append((scope_id, value))
+        return sources
+
+    async def _load_original_stats_files(
+        self,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        root = self._get_data_root()
+        candidates = (
+            root / "plugins" / "astrbot_plugin_chess" / "chess_stats.json",
+            root / "plugin_data" / "astrbot_plugin_chess" / "chess_stats.json",
+        )
+        results = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                value = await asyncio.to_thread(
+                    lambda candidate=path: json.loads(
+                        candidate.read_text(encoding="utf-8")
+                    )
+                )
+                if isinstance(value, dict):
+                    results.append((str(path), convert_legacy_chess_stats(value)))
+            except Exception as exc:  # noqa: BLE001 - preserve source and continue
+                logger.warning(f"读取旧版战绩 {path} 失败，未修改原文件: {exc}")
+        return results
+
+    async def _load_persisted_state(self) -> None:
+        state_store = self._get_state_file_store()
+        loaded = await asyncio.to_thread(state_store.load)
+        stats = dict(loaded.stats) if loaded else {}
+        active_games = dict(loaded.active_games) if loaded else {}
+        migrations = set(loaded.migrations if loaded else ())
+        if loaded and loaded.recovered_from_backup:
+            logger.warning(f"状态主文件损坏，已从 {state_store.backup_path} 恢复")
+
+        current_marker = f"kv:{getattr(self, 'plugin_id', PLUGIN_DATA_DIR_NAME)}"
+        if current_marker not in migrations:
+            current_stats = await self.get_kv_data("stats", {})
+            current_games = await self.get_kv_data("active_games", {})
+            if isinstance(current_stats, dict):
+                stats = merge_stats(
+                    stats,
+                    current_stats,
+                    history_limit=int(self.config.get("max_history_per_user", 50)),
+                )
+            if isinstance(current_games, dict):
+                active_games = {**current_games, **active_games}
+            migrations.add(current_marker)
+
+        legacy_stats = dict(await self._legacy_kv_sources("stats"))
+        legacy_games = dict(await self._legacy_kv_sources("active_games"))
+        for scope_id in legacy_stats.keys() | legacy_games.keys():
+            marker = f"kv:{scope_id}"
+            if marker in migrations:
+                continue
+            if scope_id in legacy_stats:
+                stats = merge_stats(
+                    stats,
+                    legacy_stats[scope_id],
+                    history_limit=int(self.config.get("max_history_per_user", 50)),
+                )
+            active_games = {**legacy_games.get(scope_id, {}), **active_games}
+            migrations.add(marker)
+
+        for path, value in await self._load_original_stats_files():
+            marker = f"file:{path}"
+            if marker in migrations:
+                continue
+            stats = merge_stats(
+                stats,
+                value,
+                history_limit=int(self.config.get("max_history_per_user", 50)),
+            )
+            migrations.add(marker)
+
+        self.stats = stats
+        if self.config.get("persist_active_games", True):
+            errors = self.store.restore(active_games)
+            for error in errors:
+                logger.warning(f"棋局恢复失败: {error}")
+        self._completed_migrations = sorted(migrations)
+        await asyncio.to_thread(
+            state_store.save,
+            self.stats,
+            self.store.to_dict(),
+            self._completed_migrations,
+            not (loaded and loaded.recovered_from_backup),
+        )
+        logger.info(f"多棋盘数据文件：{state_store.path}")
 
     @staticmethod
     def _avatar_url(event: AstrMessageEvent) -> str:
@@ -161,7 +317,7 @@ class BoardGamesPlugin(Star):
         try:
             request = urllib.request.Request(
                 url,
-                headers={"User-Agent": "astrbot-plugin-boardgames/2.4"},
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.4.2"},
             )
             with urllib.request.urlopen(request, timeout=3) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
@@ -197,12 +353,28 @@ class BoardGamesPlugin(Star):
         return bool(getattr(event.message_obj, "group_id", ""))
 
     async def _persist(self) -> None:
-        try:
-            await self.put_kv_data("stats", self.stats)
-            if self.config.get("persist_active_games", True):
-                await self.put_kv_data("active_games", self.store.to_dict())
-        except Exception as exc:  # noqa: BLE001 - storage backends raise adapter-specific errors
-            logger.exception(f"保存棋局数据失败: {exc}")
+        if self._storage_blocked:
+            logger.error("状态文件加载失败，本次运行跳过保存以防覆盖可恢复数据。")
+            return
+        async with self.persist_lock:
+            stats_snapshot = copy.deepcopy(self.stats)
+            games_snapshot = self.store.to_dict()
+            try:
+                await asyncio.to_thread(
+                    self._get_state_file_store().save,
+                    stats_snapshot,
+                    games_snapshot,
+                    self._completed_migrations,
+                )
+            except Exception as exc:  # noqa: BLE001 - retain KV as emergency mirror
+                logger.exception(f"保存 plugin_data 状态文件失败: {exc}")
+            try:
+                # KV 仅保留为兼容镜像和旧版本回退来源；文件是 2.4.2+ 的主存储。
+                await self.put_kv_data("stats", stats_snapshot)
+                if self.config.get("persist_active_games", True):
+                    await self.put_kv_data("active_games", games_snapshot)
+            except Exception as exc:  # noqa: BLE001 - file may still have succeeded
+                logger.exception(f"保存棋局 KV 兼容镜像失败: {exc}")
 
     async def _render(self, session: GameSession) -> bytes:
         return await asyncio.to_thread(self.renderer.render, session)
