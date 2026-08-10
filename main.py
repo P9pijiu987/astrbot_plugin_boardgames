@@ -41,6 +41,8 @@ from .boardgames.render import BoardRenderer
 from .boardgames.session import GameSession, Player, SessionStore
 from .boardgames.storage import (
     JsonStateStore,
+    LoadedState,
+    StateFileError,
     convert_legacy_chess_stats,
     merge_stats,
 )
@@ -76,27 +78,43 @@ class BoardGamesPlugin(Star):
         self._state_file_store: JsonStateStore | None = None
         self._data_root: Path | None = None
         self._completed_migrations: list[str] = []
-        self._storage_blocked = False
+        self._initialize_lock = asyncio.Lock()
+        self._initialized = False
+        # 恢复完成前默认禁止写入，避免热更新产生的空实例覆盖已有数据。
+        self._storage_blocked = True
+
+    async def initialize(self):
+        """每次安装、更新或热重载插件时恢复未结束棋局和战绩。"""
+        async with self._initialize_lock:
+            if self._initialized:
+                return
+            try:
+                await self._load_persisted_state()
+                for session in self.store.sessions.values():
+                    if session.status in {"waiting", "choosing"}:
+                        self._schedule_wait_timeout(session)
+                    elif session.status == "playing":
+                        if session.clock is None and not session.clock_disabled:
+                            session.clock = self._create_game_clock(
+                                session.game_id, None
+                            )
+                            start_clock(session.clock)
+                        self._schedule_clock(session)
+            except Exception as exc:  # noqa: BLE001 - keep plugin recoverable
+                self._storage_blocked = True
+                logger.exception(
+                    "载入棋局数据失败，为防止覆盖原文件，"
+                    f"本次运行将禁止持久化: {exc}"
+                )
+                return
+            self._storage_blocked = False
+            self._initialized = True
+            logger.info(f"多棋盘插件已载入，恢复 {len(self.store.sessions)} 局。")
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
-        """恢复未结束棋局和战绩。"""
-        try:
-            await self._load_persisted_state()
-            for session in self.store.sessions.values():
-                if session.status in {"waiting", "choosing"}:
-                    self._schedule_wait_timeout(session)
-                elif session.status == "playing":
-                    if session.clock is None and not session.clock_disabled:
-                        session.clock = self._create_game_clock(session.game_id, None)
-                        start_clock(session.clock)
-                    self._schedule_clock(session)
-            logger.info(f"多棋盘插件已载入，恢复 {len(self.store.sessions)} 局。")
-        except Exception as exc:  # noqa: BLE001 - plugin startup must remain recoverable
-            self._storage_blocked = True
-            logger.exception(
-                f"载入棋局数据失败，为防止覆盖原文件，本次运行将禁止持久化: {exc}"
-            )
+        """兼容全局启动事件；热更新恢复由 initialize() 保证。"""
+        await self.initialize()
 
     async def terminate(self):
         for task in self.timeout_tasks.values():
@@ -193,16 +211,37 @@ class BoardGamesPlugin(Star):
     async def _load_persisted_state(self) -> None:
         state_store = self._get_state_file_store()
         loaded = await asyncio.to_thread(state_store.load)
+        if loaded and not loaded.stats:
+            try:
+                backup = await asyncio.to_thread(state_store.load_backup)
+            except StateFileError as exc:
+                backup = None
+                logger.warning(f"状态备份无法读取，将继续尝试 KV 和旧数据源: {exc}")
+            if backup and backup.stats:
+                # 2.4.2/2.4.3 热更新缺陷可能写出“合法但为空”的主文件。
+                # 此时优先恢复仍含战绩的备份，同时保留主文件中较新的棋局。
+                loaded = LoadedState(
+                    dict(backup.stats),
+                    {**backup.active_games, **loaded.active_games},
+                    tuple(sorted(set(backup.migrations) | set(loaded.migrations))),
+                    recovered_from_backup=True,
+                )
+                logger.warning(
+                    f"检测到空战绩主文件，已自动从 {state_store.backup_path} 恢复"
+                )
         stats = dict(loaded.stats) if loaded else {}
         active_games = dict(loaded.active_games) if loaded else {}
         migrations = set(loaded.migrations if loaded else ())
         if loaded and loaded.recovered_from_backup:
-            logger.warning(f"状态主文件损坏，已从 {state_store.backup_path} 恢复")
+            logger.warning(f"状态主文件异常，已从 {state_store.backup_path} 恢复")
 
         current_marker = f"kv:{getattr(self, 'plugin_id', PLUGIN_DATA_DIR_NAME)}"
-        if current_marker not in migrations:
-            current_stats = await self.get_kv_data("stats", {})
-            current_games = await self.get_kv_data("active_games", {})
+        current_stats = await self.get_kv_data("stats", {})
+        current_games = await self.get_kv_data("active_games", {})
+        recover_current_kv = (
+            not stats and isinstance(current_stats, dict) and bool(current_stats)
+        )
+        if current_marker not in migrations or recover_current_kv:
             if isinstance(current_stats, dict):
                 stats = merge_stats(
                     stats,
@@ -212,12 +251,14 @@ class BoardGamesPlugin(Star):
             if isinstance(current_games, dict):
                 active_games = {**current_games, **active_games}
             migrations.add(current_marker)
+            if recover_current_kv:
+                logger.warning("状态文件战绩为空，已从当前插件 KV 镜像恢复")
 
         legacy_stats = dict(await self._legacy_kv_sources("stats"))
         legacy_games = dict(await self._legacy_kv_sources("active_games"))
         for scope_id in legacy_stats.keys() | legacy_games.keys():
             marker = f"kv:{scope_id}"
-            if marker in migrations:
+            if marker in migrations and stats:
                 continue
             if scope_id in legacy_stats:
                 stats = merge_stats(
@@ -230,7 +271,7 @@ class BoardGamesPlugin(Star):
 
         for path, value in await self._load_original_stats_files():
             marker = f"file:{path}"
-            if marker in migrations:
+            if marker in migrations and stats:
                 continue
             stats = merge_stats(
                 stats,
@@ -317,7 +358,7 @@ class BoardGamesPlugin(Star):
         try:
             request = urllib.request.Request(
                 url,
-                headers={"User-Agent": "astrbot-plugin-boardgames/2.4.3"},
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.4.4"},
             )
             with urllib.request.urlopen(request, timeout=3) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
@@ -353,6 +394,9 @@ class BoardGamesPlugin(Star):
         return bool(getattr(event.message_obj, "group_id", ""))
 
     async def _persist(self) -> None:
+        if not self._initialized:
+            logger.warning("插件数据尚未恢复，跳过保存以防空状态覆盖历史战绩。")
+            return
         if self._storage_blocked:
             logger.error("状态文件加载失败，本次运行跳过保存以防覆盖可恢复数据。")
             return

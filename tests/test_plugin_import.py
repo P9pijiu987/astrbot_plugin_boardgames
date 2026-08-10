@@ -145,6 +145,78 @@ async def _collect(generator):
 
 
 class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uninitialized_hot_reload_instance_cannot_overwrite_stats(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "plugin_data" / "astrbot_plugin_boardgames" / "state.json"
+            state_store = module.JsonStateStore(path)
+            expected = {
+                "1": {
+                    "go": {
+                        "wins": 3,
+                        "draws": 1,
+                        "losses": 2,
+                        "rating": 1024,
+                        "history": [],
+                    }
+                }
+            }
+            state_store.save(expected, {}, ["kv:astrbot_plugin_boardgames"])
+
+            plugin = module.BoardGamesPlugin(
+                SimpleNamespace(send_message=None),
+                {},
+            )
+            plugin._data_root = root
+            plugin._state_file_store = state_store
+
+            # 模拟旧缺陷：热重载已创建新实例，但尚未执行任何恢复钩子。
+            await plugin.terminate()
+            self.assertEqual(state_store.load().stats, expected)
+
+            await plugin.initialize()
+            self.assertTrue(plugin._initialized)
+            self.assertFalse(plugin._storage_blocked)
+            self.assertEqual(plugin.stats, expected)
+            await plugin.terminate()
+
+    async def test_empty_primary_state_recovers_nonempty_backup(self):
+        module = importlib.import_module("astrbot_plugin_boardgames.main")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "plugin_data" / "astrbot_plugin_boardgames" / "state.json"
+            state_store = module.JsonStateStore(path)
+            expected = {
+                "7": {
+                    "chess": {
+                        "wins": 5,
+                        "draws": 0,
+                        "losses": 1,
+                        "rating": 1060,
+                        "history": [],
+                    }
+                }
+            }
+            marker = "kv:astrbot_plugin_boardgames"
+            state_store.save(expected, {}, [marker])
+            state_store.save({}, {}, [marker])
+            self.assertEqual(state_store.load().stats, {})
+            self.assertEqual(state_store.load_backup().stats, expected)
+
+            plugin = module.BoardGamesPlugin(
+                SimpleNamespace(send_message=None),
+                {},
+            )
+            plugin._data_root = root
+            plugin._state_file_store = state_store
+            await plugin.initialize()
+
+            self.assertEqual(plugin.stats, expected)
+            self.assertEqual(state_store.load().stats, expected)
+            self.assertEqual(state_store.load_backup().stats, expected)
+            await plugin.terminate()
+
     async def test_kv_state_is_migrated_to_plugin_data_file(self):
         module = importlib.import_module("astrbot_plugin_boardgames.main")
         with tempfile.TemporaryDirectory() as directory:

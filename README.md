@@ -15,7 +15,7 @@
 
 在 AstrBot WebUI 的插件管理中上传本插件 ZIP。新版要求 AstrBot `>=4.9.2,<5`，依赖会通过 `requirements.txt` 安装。
 
-若从旧版覆盖升级，建议先在旧棋局结束后再更新。2.4.2 起，长期数据主文件位于 `data/plugin_data/astrbot_plugin_boardgames/state.json`，旁边保留上一版 `state.json.bak`；AstrBot 插件 KV 仅作为兼容镜像。2.4.3 起，井字棋固定视角，规则自然终局会把最终棋盘和结算卡合并为一张图。
+若从旧版覆盖升级，建议先在旧棋局结束后再更新。2.4.2 起，长期数据主文件位于 `data/plugin_data/astrbot_plugin_boardgames/state.json`，旁边保留上一版 `state.json.bak`；AstrBot 插件 KV 仅作为兼容镜像。2.4.3 起，井字棋固定视角，规则自然终局会把最终棋盘和结算卡合并为一张图。2.4.4 修复热更新生命周期，并会从仍有数据的备份或 KV 自动恢复被空主文件遮住的战绩。
 
 首次启动 2.4.2 会自动尝试导入当前 `astrbot_plugin_boardgames` KV、改名前的 `astrbot_plugin_chess` KV，以及仍可找到的原版 `chess_stats.json`。每个来源只迁移一次，旧数据不会被删除。若旧版本因缺少更新源而必须删除后重装，请在卸载时**取消勾选**“同时删除插件持久化数据”；勾选该项会同时删除 `plugin_data` 和插件 KV。
 
