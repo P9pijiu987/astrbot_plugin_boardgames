@@ -86,6 +86,18 @@ class JsonStateStore:
             )
         return None
 
+    def load_backup(self) -> LoadedState | None:
+        """单独读取备份，供有效但异常为空的主文件执行灾难恢复。"""
+        if not self.backup_path.exists():
+            return None
+        backup = self._decode(self.backup_path)
+        return LoadedState(
+            backup.stats,
+            backup.active_games,
+            backup.migrations,
+            recovered_from_backup=True,
+        )
+
     def save(
         self,
         stats: dict[str, Any],
