@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 OUTPUTS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(OUTPUTS))
@@ -581,6 +582,132 @@ class PluginFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("【简介】", result[0][1])
             self.assertIn("【详细】", result[0][1])
         await plugin.terminate()
+
+
+class TimeExtensionFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.module = importlib.import_module("astrbot_plugin_boardgames.main")
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.plugin = self.module.BoardGamesPlugin(SimpleNamespace(send_message=None), {})
+        self.plugin._data_root = Path(self.directory.name)
+        await self.plugin.initialize()
+        self.addAsyncCleanup(self.plugin.terminate)
+        self.starter = _Event("1", "甲")
+        self.joiner = _Event("2", "乙")
+        self.outsider = _Event("3", "路人")
+        self.session = self.module.GameSession(
+            key=self.starter.unified_msg_origin,
+            game_id="tictactoe",
+            engine=self.module.create_engine("tictactoe"),
+            players={
+                "first": self.module.Player("1", "甲"),
+                "second": self.module.Player("2", "乙"),
+            },
+            status="playing",
+            clock=self.module.create_clock(self.module.parse_time_control("10+5")),
+        )
+        self.module.start_clock(self.session.clock, 100.0)
+        self.plugin.store.put(self.session)
+        self.time_patch = patch.object(self.module.time, "time", return_value=130.0)
+        self.time_patch.start()
+        self.addCleanup(self.time_patch.stop)
+
+    async def test_default_request_requires_opponent_and_only_applies_once(self):
+        requested = await _collect(self.plugin.request_time(self.starter))
+        self.assertIn("3 分钟", requested[0][1])
+        self.assertEqual(self.session.clock["remaining"]["first"], 600)
+        for event in (self.starter, self.outsider):
+            await _collect(self.plugin.agree_time(event))
+            self.assertEqual(self.session.clock["remaining"]["first"], 600)
+            self.assertIsNotNone(self.session.pending)
+        accepted = await _collect(self.plugin.agree_time(self.joiner))
+        self.assertIn("双方各增加 3 分钟", accepted[0][1])
+        self.assertEqual(self.module.clock_view(self.session.clock, "first")["main"], 750)
+        self.assertEqual(self.module.clock_view(self.session.clock, "second")["main"], 780)
+        self.assertIsNone(self.session.pending)
+        await _collect(self.plugin.agree_time(self.joiner))
+        self.assertEqual(self.session.clock["remaining"]["first"], 780)
+
+    async def test_custom_minutes_and_rejection(self):
+        await _collect(self.plugin.request_time(self.starter, "5"))
+        for event in (self.starter, self.outsider):
+            await _collect(self.plugin.deny_time(event))
+            self.assertIsNotNone(self.session.pending)
+        denied = await _collect(self.plugin.deny_time(self.joiner))
+        self.assertIn("已拒绝", denied[0][1])
+        self.assertIsNone(self.session.pending)
+        self.assertEqual(self.session.clock["remaining"]["first"], 600)
+        await _collect(self.plugin.request_time(self.joiner, "1.5"))
+        await _collect(self.plugin.agree_time(self.starter))
+        self.assertEqual(self.session.clock["remaining"]["first"], 690)
+        self.assertEqual(self.session.clock["remaining"]["second"], 690)
+
+    async def test_invalid_requests_do_not_change_session(self):
+        for amount in ("0", "-1", "abc", "nan", "inf", "1e308"):
+            result = await _collect(self.plugin.request_time(self.starter, amount))
+            self.assertIn("用法", result[0][1])
+            self.assertIsNone(self.session.pending)
+        await _collect(self.plugin.request_time(self.outsider))
+        self.assertIsNone(self.session.pending)
+        self.session.status = "waiting"
+        await _collect(self.plugin.request_time(self.starter))
+        self.assertIsNone(self.session.pending)
+        self.session.status = "playing"
+        self.session.clock = None
+        await _collect(self.plugin.request_time(self.starter))
+        self.assertIsNone(self.session.pending)
+
+    async def test_existing_request_is_not_overwritten(self):
+        pending = {"type": "draw", "requester": "2"}
+        self.session.pending = pending
+        await _collect(self.plugin.request_time(self.starter))
+        self.assertEqual(self.session.pending, pending)
+
+    async def test_request_survives_moves_and_persistence(self):
+        await _collect(self.plugin.request_time(self.starter, "5"))
+        await _collect(self.plugin.receive_bare_move(_Event("1", "甲", "1")))
+        self.assertEqual(self.session.pending["minutes"], 5)
+        saved = self.plugin._get_state_file_store().load()
+        self.plugin.store.restore(saved.active_games)
+        self.session = self.plugin.store.get(self.session.key)
+        await _collect(self.plugin.agree_time(self.joiner))
+        self.assertEqual(self.session.clock["remaining"]["first"], 875)
+        self.assertEqual(self.session.clock["remaining"]["second"], 900)
+
+    async def test_byoyomi_stage_is_checked_at_agreement(self):
+        self.session.clock = self.module.create_clock(
+            self.module.parse_time_control("1|3x30")
+        )
+        self.module.start_clock(self.session.clock, 100.0)
+        requested = await _collect(self.plugin.request_time(self.starter, "5"))
+        self.assertIn("2 次读秒", requested[0][1])
+        with patch.object(self.module.time, "time", return_value=191.0):
+            accepted = await _collect(self.plugin.agree_time(self.joiner))
+            self.assertIn("双方各增加 2 次读秒", accepted[0][1])
+            view = self.module.clock_view(self.session.clock, "first")
+            self.assertEqual(view["periods"], 4)
+            self.assertEqual(view["period_remaining"], 29)
+        self.assertEqual(self.session.clock["remaining"]["second"], 60)
+        self.assertEqual(self.session.clock["periods_left"]["second"], 5)
+
+    async def test_simultaneous_agreements_only_extend_once(self):
+        await _collect(self.plugin.request_time(self.starter))
+        await asyncio.gather(
+            _collect(self.plugin.agree_time(self.joiner)),
+            _collect(self.plugin.agree_time(self.joiner)),
+        )
+        self.assertEqual(self.session.clock["remaining"], {"first": 780, "second": 780})
+
+    async def test_expiration_before_agreement_records_loss_without_extension(self):
+        await _collect(self.plugin.request_time(self.starter))
+        self.plugin._render_result_card = AsyncMock(return_value=b"card")
+        with patch.object(self.module.time, "time", return_value=700.0):
+            accepted = await _collect(self.plugin.agree_time(self.joiner))
+        self.assertIn("超时方判负", accepted[-1][1])
+        self.assertIsNone(self.plugin.store.get(self.session.key))
+        self.assertEqual(self.plugin.stats["2"]["tictactoe"]["wins"], 1)
+        self.assertEqual(self.session.clock["remaining"]["first"], 600)
 
 
 if __name__ == "__main__":
