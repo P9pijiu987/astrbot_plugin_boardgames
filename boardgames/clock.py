@@ -144,6 +144,30 @@ def timed_out_side(
     return side if view and view["timed_out"] else None
 
 
+def extend_clock(
+    clock: dict[str, Any], minutes: float = 3, now: float | None = None
+) -> str:
+    """Extend both clocks without switching turns or refunding elapsed time.
+
+    If either player has reached byoyomi, grant two periods to each player.
+    Otherwise add the requested minutes to each player's remaining main time.
+    """
+    if not math.isfinite(minutes * 60) or minutes <= 0:
+        raise ValueError("加时分钟数必须是大于 0 的有效数字。")
+    moment = float(now if now is not None else time.time())
+    if not clock.get("running") or timed_out_side(clock, moment):
+        raise ValueError("棋钟尚未运行或已经超时，不能加时。")
+    if clock["mode"] == "byoyomi" and any(
+        clock_view(clock, side, moment)["main"] <= 0 for side in (FIRST, SECOND)
+    ):
+        for side in (FIRST, SECOND):
+            clock["periods_left"][side] += 2
+        return "periods"
+    for side in (FIRST, SECOND):
+        clock["remaining"][side] += minutes * 60
+    return "minutes"
+
+
 def settle_and_switch(
     clock: dict[str, Any] | None,
     next_side: str,

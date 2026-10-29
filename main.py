@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 import time
 import urllib.request
@@ -21,6 +22,7 @@ from .boardgames.clock import (
     clock_view,
     create_clock,
     crossed_reminder,
+    extend_clock,
     format_clock,
     parse_reminder_schedule,
     parse_time_control,
@@ -362,7 +364,7 @@ class BoardGamesPlugin(Star):
         try:
             request = urllib.request.Request(
                 url,
-                headers={"User-Agent": "astrbot-plugin-boardgames/2.5.1"},
+                headers={"User-Agent": "astrbot-plugin-boardgames/2.5.2"},
             )
             with urllib.request.urlopen(request, timeout=3) as response:
                 data = response.read(2 * 1024 * 1024 + 1)
@@ -554,7 +556,7 @@ class BoardGamesPlugin(Star):
             explanation = f"本局用时：{label}。"
         text = (
             f"{explanation}\n"
-            "本局开始后不能修改棋钟；下次开局可追加 计时=15+10、"
+            "局中可用 /加时 [分钟] 请求双方加时，需对手同意；下次开局可追加 计时=15+10、"
             "计时=60|3x30 或 不计时。使用 /计时规则 查看完整说明。"
         )
         prompt = cls._action_prompt(session)
@@ -1004,7 +1006,8 @@ class BoardGamesPlugin(Star):
                 if session.clock:
                     session.clock["active"] = session.engine.turn
                     session.clock["turn_started_at"] = moment
-            session.pending = None
+            if not session.pending or session.pending.get("type") != "extend_time":
+                session.pending = None
             session.last_action_at = moment
             await self._persist()
             return None, await self._render(session), None
@@ -1154,7 +1157,8 @@ class BoardGamesPlugin(Star):
                 yield event.plain_result("行棋完成前比赛用时耗尽，对手获胜。")
                 return
             session.last_action_at = moment
-            session.pending = None
+            if not session.pending or session.pending.get("type") != "extend_time":
+                session.pending = None
             image = await self._render(session)
             end_text = ""
             action_text = ""
@@ -1299,6 +1303,104 @@ class BoardGamesPlugin(Star):
         if not side:
             return session, None, "只有本局选手可以操作。"
         return session, side, None
+
+    @filter.command("加时")
+    async def request_time(self, event: AstrMessageEvent, minutes: str = "3"):
+        """请求双方各加指定分钟（默认 3）；读秒阶段双方各加 2 次读秒。"""
+        async with self.store.lock(self._key(event)):
+            session, side, error = self._require_player(event)
+            if error:
+                yield event.plain_result(error)
+                return
+            try:
+                amount = float(minutes)
+                if not math.isfinite(amount * 60) or amount <= 0:
+                    raise ValueError
+            except (ValueError, OverflowError):
+                yield event.plain_result("用法：/加时 [分钟]，默认 3 分钟；请输入大于 0 的有效数字。")
+                return
+            if not session.clock or not session.clock.get("running"):
+                yield event.plain_result("本局未启用运行中的棋钟，不能加时。")
+                return
+            if timed_out_side(session.clock):
+                yield event.plain_result("比赛用时已经耗尽，不能申请加时。")
+                return
+            if session.pending:
+                yield event.plain_result("已有待处理的请求，请先由对手同意或拒绝。")
+                return
+            session.pending = {
+                "type": "extend_time",
+                "requester": str(event.get_sender_id()),
+                "side": side,
+                "minutes": amount,
+                "created_at": time.time(),
+            }
+            await self._persist()
+            rule = f"双方各增加 {amount:g} 分钟"
+            if session.clock["mode"] == "byoyomi":
+                rule += "；同意时若任一方已进入读秒，则改为双方各增加 2 次读秒"
+            yield event.plain_result(
+                f"已申请加时：{rule}。等待期间棋钟继续运行。"
+                "对手请使用 /同意加时 或 /拒绝加时。"
+            )
+
+    @filter.command("同意加时")
+    async def agree_time(self, event: AstrMessageEvent):
+        async with self.store.lock(self._key(event)):
+            session, _, error = self._require_player(event)
+            if error:
+                yield event.plain_result(error)
+                return
+            pending = session.pending or {}
+            if pending.get("type") != "extend_time" or pending.get("requester") == str(
+                event.get_sender_id()
+            ):
+                yield event.plain_result("没有可同意的加时请求。")
+                return
+            moment = time.time()
+            loser = timed_out_side(session.clock, moment)
+            if loser:
+                winner_side = opponent(loser)
+                records = self._record_result(session, winner_side, "timeout")
+                result_card = await self._render_result_card(
+                    session, winner_side, records, "同意加时前比赛用时已经耗尽"
+                )
+                self._cancel_clock(session.key)
+                self.store.remove(session.key)
+                await self._persist()
+                yield self._image_result(event, result_card)
+                yield event.plain_result("比赛用时已经耗尽，无法加时，超时方判负。")
+                return
+            if not session.clock or not session.clock.get("running"):
+                yield event.plain_result("本局未启用运行中的棋钟，不能加时。")
+                return
+            amount = float(pending["minutes"])
+            unit = extend_clock(session.clock, amount, moment)
+            session.pending = None
+            await self._persist()
+            addition = "2 次读秒" if unit == "periods" else f"{amount:g} 分钟"
+            yield event.plain_result(
+                f"对手已同意加时，双方各增加 {addition}，棋局继续。\n"
+                f"{session.engine.side_names[0]}：{format_clock(session.clock, FIRST)}\n"
+                f"{session.engine.side_names[1]}：{format_clock(session.clock, SECOND)}"
+            )
+
+    @filter.command("拒绝加时")
+    async def deny_time(self, event: AstrMessageEvent):
+        async with self.store.lock(self._key(event)):
+            session, _, error = self._require_player(event)
+            if error:
+                yield event.plain_result(error)
+                return
+            pending = session.pending or {}
+            if pending.get("type") != "extend_time" or pending.get("requester") == str(
+                event.get_sender_id()
+            ):
+                yield event.plain_result("没有可拒绝的加时请求。")
+                return
+            session.pending = None
+            await self._persist()
+            yield event.plain_result("已拒绝加时，棋局继续。")
 
     @filter.command("悔棋", alias={"请求悔棋"})
     async def request_undo(self, event: AstrMessageEvent):
@@ -1737,6 +1839,9 @@ class BoardGamesPlugin(Star):
             "/开局 围棋 计时=60|3x30（60分钟，随后3次30秒读秒）\n"
             "/开局 黑白棋 计时=10（每方包干10分钟）\n"
             "/开局 五子棋 不计时\n"
+            "局中 /加时 默认请求双方各加3分钟，/加时 5 则各加5分钟；"
+            "需对手 /同意加时，可用 /拒绝加时 拒绝，等待期间继续计时。\n"
+            "围棋任一方进入读秒后，同意加时改为双方各增加2次读秒，每次秒数不变。\n"
             "默认：国际象棋15+10、围棋60|3x30、中国象棋10+5、"
             "五子棋20+3、井字棋2+2、黑白棋10。管理员可在插件配置中逐项修改。\n"
             "默认提醒：全程每分钟、3分钟内每30秒、2分钟内每15秒、"
@@ -1995,9 +2100,9 @@ class BoardGamesPlugin(Star):
             "      /开局 围棋 19路 计时=60|3x30\n"
             "      /开局 五子棋 连珠 Swap2\n"
             "【入场与选边】/加入棋局；/选先 /选后 /选黑 /选白 /选红\n"
-            "【对局】/棋盘 /棋谱 /棋钟 /悔棋 /和棋 /流局 /认输\n"
+            "【对局】/棋盘 /棋谱 /棋钟 /加时 [分钟] /悔棋 /和棋 /流局 /认输\n"
             "同意或拒绝：/同意悔棋 /拒绝悔棋 /同意和棋 /拒绝和棋 "
-            "/同意流局 /拒绝流局\n"
+            "/同意流局 /拒绝流局 /同意加时 /拒绝加时\n"
             "【分析】/AI分析；围棋可用 /势力范围；对手用 /同意AI 或 /拒绝AI\n"
             "【记录】/战绩；/对局记录 [@玩家] [棋种]；/排行榜 [棋种]\n"
             "【说明】/下棋帮助 /计时规则 /等级分说明 /围棋计分\n"
